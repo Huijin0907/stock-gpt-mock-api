@@ -1,0 +1,12 @@
+{
+  "name": "stock-gpt-mock-api",
+  "version": "1.0.0",
+  "description": "Mock API for Custom GPT stock research agent",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
