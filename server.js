@@ -237,6 +237,90 @@ app.post("/v1/fundamental-actuals-pack", (req, res) => {
   ]));
 });
 
+app.post("/v1/estimates-targets-pack", (req, res) => {
+  const symbol = (req.body.symbol || "").toUpperCase().trim();
+  if (!symbol) {
+    return res
+      .status(400)
+      .json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
+  }
+
+  const map = {
+    MSFT: {
+      eps_fy0_est: 13.2,
+      eps_fy1_est: 14.4,
+      eps_fy2_est: 15.8,
+      revenue_fy0_est: 276000000000,
+      revenue_fy1_est: 292000000000,
+      revenue_fy2_est: 309000000000,
+      target_price_consensus: 495.0,
+      target_price_low: 430.0,
+      target_price_high: 560.0,
+      analyst_count: 42,
+      estimate_revision_direction: "up"
+    },
+    BABA: {
+      eps_fy0_est: 9.1,
+      eps_fy1_est: 10.0,
+      eps_fy2_est: 11.2,
+      revenue_fy0_est: 980000000000,
+      revenue_fy1_est: 1050000000000,
+      revenue_fy2_est: 1125000000000,
+      target_price_consensus: 108.0,
+      target_price_low: 86.0,
+      target_price_high: 132.0,
+      analyst_count: 31,
+      estimate_revision_direction: "mixed"
+    },
+    QQQ: {
+      eps_fy0_est: null,
+      eps_fy1_est: null,
+      eps_fy2_est: null,
+      revenue_fy0_est: null,
+      revenue_fy1_est: null,
+      revenue_fy2_est: null,
+      target_price_consensus: null,
+      target_price_low: null,
+      target_price_high: null,
+      analyst_count: 0,
+      estimate_revision_direction: "unavailable"
+    },
+    GLD: {
+      eps_fy0_est: null,
+      eps_fy1_est: null,
+      eps_fy2_est: null,
+      revenue_fy0_est: null,
+      revenue_fy1_est: null,
+      revenue_fy2_est: null,
+      target_price_consensus: null,
+      target_price_low: null,
+      target_price_high: null,
+      analyst_count: 0,
+      estimate_revision_direction: "unavailable"
+    }
+  };
+
+  const data = map[symbol] || {
+    eps_fy0_est: 5.0,
+    eps_fy1_est: 5.5,
+    eps_fy2_est: 6.1,
+    revenue_fy0_est: 10000000000,
+    revenue_fy1_est: 11000000000,
+    revenue_fy2_est: 12100000000,
+    target_price_consensus: 100.0,
+    target_price_low: 80.0,
+    target_price_high: 120.0,
+    analyst_count: 10,
+    estimate_revision_direction: "flat"
+  };
+
+  return res.json(
+    success(data, [
+      { provider: "mock", status: "ok", note: "mock estimates and target price used" }
+    ])
+  );
+});
+
 app.get("/", (req, res) => {
   res.json({
     ok: true,
