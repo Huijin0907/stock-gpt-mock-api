@@ -329,7 +329,8 @@ app.get("/", (req, res) => {
       "/v1/classify-instrument",
       "/v1/security-master",
       "/v1/market-price-pack",
-      "/v1/fundamental-actuals-pack"
+      "/v1/fundamental-actuals-pack",
+      "/v1/estimates-targets-pack"
     ]
   });
 });
