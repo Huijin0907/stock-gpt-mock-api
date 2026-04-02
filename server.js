@@ -321,6 +321,78 @@ app.post("/v1/estimates-targets-pack", (req, res) => {
   );
 });
 
+app.post("/v1/macro-breadth-liquidity-pack", (req, res) => {
+  const symbol = (req.body.symbol || "").toUpperCase().trim();
+  if (!symbol) {
+    return res
+      .status(400)
+      .json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
+  }
+
+  const defaultData = {
+    macro_regime: "disinflation_with_stable_growth",
+    market_state: "trend_up_but_narrowing_breadth",
+    liquidity_state: "neutral_to_tightening",
+    should_enter_valuation: "scenario_only",
+    risk_free_rate: 0.0435,
+    yield_curve_slope: 0.0021,
+    usd_context: "slightly_firm",
+    breadth_score: 58.4,
+    breadth_health: "neutral",
+    breadth_notes: [
+      "Cap-weight index leadership remains concentrated",
+      "Participation above 200DMA is healthy but not expanding",
+      "Liquidity backdrop is not fully risk-on"
+    ]
+  };
+
+  const map = {
+    MSFT: {
+      ...defaultData,
+      should_enter_valuation: "scenario_only"
+    },
+    BABA: {
+      ...defaultData,
+      usd_context: "firm_usd_is_headwind_for_adr_translation",
+      should_enter_valuation: "direct"
+    },
+    QQQ: {
+      ...defaultData,
+      market_state: "trend_up_with_narrow_leadership",
+      should_enter_valuation: "direct",
+      breadth_notes: [
+        "Nasdaq leadership remains concentrated in large-cap growth",
+        "Equal-weight participation is weaker than cap-weight performance",
+        "Broadening is improving but not yet decisive"
+      ]
+    },
+    GLD: {
+      macro_regime: "real_rate_sensitive_gold_environment",
+      market_state: "range_bound_with_macro_bids",
+      liquidity_state: "neutral",
+      should_enter_valuation: "direct",
+      risk_free_rate: 0.0435,
+      yield_curve_slope: 0.0021,
+      usd_context: "firm_usd_caps_gold_upside",
+      breadth_score: 50.0,
+      breadth_health: "neutral",
+      breadth_notes: [
+        "Gold-related products are more sensitive to real rates and USD than equity breadth",
+        "Risk-off demand exists but is not dominant",
+        "Macro impulse matters more than stock-style participation"
+      ]
+    }
+  };
+
+  const data = map[symbol] || defaultData;
+
+  return res.json(
+    success(data, [
+      { provider: "mock", status: "ok", note: "mock macro breadth liquidity pack used" }
+    ])
+  );
+});
+
 app.get("/", (req, res) => {
   res.json({
     ok: true,
@@ -330,7 +402,8 @@ app.get("/", (req, res) => {
       "/v1/security-master",
       "/v1/market-price-pack",
       "/v1/fundamental-actuals-pack",
-      "/v1/estimates-targets-pack"
+      "/v1/estimates-targets-pack",
+      "/v1/macro-breadth-liquidity-pack"
     ]
   });
 });
