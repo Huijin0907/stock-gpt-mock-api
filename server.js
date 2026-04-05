@@ -280,6 +280,210 @@ function formatDateYYYYMMDD(dateObj) {
   return `${y}-${m}-${d}`;
 }
 
+function firstArrayOrEmpty(payload) {
+  if (!payload) return [];
+  if (Array.isArray(payload)) return payload;
+  if (Array.isArray(payload?.data)) return payload.data;
+  if (Array.isArray(payload?.results)) return payload.results;
+  return [];
+}
+
+function firstObject(payload) {
+  const arr = firstArrayOrEmpty(payload);
+  if (arr.length > 0) return arr[0];
+  if (payload && typeof payload === "object" && !Array.isArray(payload)) return payload;
+  return null;
+}
+
+function safeAbsCapex(capex) {
+  if (capex === null || capex === undefined) return null;
+  return Math.abs(Number(capex));
+}
+
+function choose(...vals) {
+  for (const v of vals) {
+    if (v !== null && v !== undefined && v !== "") return v;
+  }
+  return null;
+}
+
+function buildStatementMapByDate(rows) {
+  const m = new Map();
+  for (const r of rows) {
+    const key = choose(r.date, r.fillingDate, r.acceptedDate);
+    if (!key) continue;
+    m.set(key, r);
+  }
+  return m;
+}
+
+function buildUnifiedPeriods(incomeRows, balanceRows, cashRows, periodType) {
+  const incomeMap = buildStatementMapByDate(incomeRows);
+  const balanceMap = buildStatementMapByDate(balanceRows);
+  const cashMap = buildStatementMapByDate(cashRows);
+
+  const keys = Array.from(new Set([
+    ...incomeMap.keys(),
+    ...balanceMap.keys(),
+    ...cashMap.keys()
+  ])).sort().reverse();
+
+  return keys.map((key) => {
+    const i = incomeMap.get(key) || {};
+    const b = balanceMap.get(key) || {};
+    const c = cashMap.get(key) || {};
+
+    const revenue = toNum(choose(i.revenue), null);
+    const grossProfit = toNum(choose(i.grossProfit), null);
+    const ebit = toNum(choose(i.operatingIncome, i.ebit), null);
+    const ebitda = toNum(choose(i.ebitda), null);
+    const netIncome = toNum(choose(i.netIncome), null);
+    const epsGaap = toNum(choose(i.eps, i.epsdiluted, i.epsDiluted), null);
+    const epsNonGaap = toNum(choose(i.epsdiluted, i.epsDiluted, i.eps), null);
+    const cfo = toNum(choose(
+      c.netCashProvidedByOperatingActivities,
+      c.operatingCashFlow,
+      c.cashFlowFromOperations
+    ), null);
+    const capexRaw = toNum(choose(
+      c.capitalExpenditure,
+      c.capex
+    ), null);
+    const capex = capexRaw === null ? null : safeAbsCapex(capexRaw);
+    const fcff = (cfo !== null && capex !== null) ? (cfo - capex) : null;
+
+    const cash = toNum(choose(
+      b.cashAndCashEquivalents,
+      b.cashAndCashEquivalentsAtCarryingValue,
+      b.cashAndShortTermInvestments
+    ), null);
+
+    const debt = toNum(choose(
+      b.totalDebt,
+      b.shortTermDebt,
+      b.longTermDebt
+    ), null);
+
+    const dilutedShares = toNum(choose(
+      i.weightedAverageShsOutDil,
+      i.weightedAverageShsOut,
+      i.weightedAverageSharesDiluted
+    ), null);
+
+    const grossMargin = revenue !== null && grossProfit !== null && revenue !== 0 ? grossProfit / revenue : null;
+    const ebitMargin = revenue !== null && ebit !== null && revenue !== 0 ? ebit / revenue : null;
+    const fcfMargin = revenue !== null && fcff !== null && revenue !== 0 ? fcff / revenue : null;
+
+    const netCash = (cash !== null && debt !== null) ? (cash - debt) : null;
+
+    const fiscalYear = toNum(choose(i.calendarYear, b.calendarYear, c.calendarYear, key?.slice?.(0, 4)), null);
+    const periodLabel = choose(i.period, b.period, c.period, periodType === "annual" ? `FY${fiscalYear}` : null);
+    const filingDate = choose(i.fillingDate, b.fillingDate, c.fillingDate, null);
+
+    return {
+      fiscal_period: periodType === "annual"
+        ? `FY${fiscalYear ?? ""}`
+        : choose(periodLabel, key),
+      fiscal_year: fiscalYear,
+      period_type: periodType,
+      period_end: key || null,
+      filing_date: filingDate,
+      revenue,
+      gross_profit: grossProfit,
+      ebit,
+      ebitda,
+      net_income: netIncome,
+      eps_gaap: epsGaap,
+      eps_nongaap: epsNonGaap,
+      cfo,
+      capex,
+      fcff,
+      cash,
+      debt,
+      net_cash: netCash,
+      diluted_shares: dilutedShares,
+      gross_margin: grossMargin,
+      ebit_margin: ebitMargin,
+      fcf_margin: fcfMargin,
+      roe: toNum(choose(i.roe, b.roe), null),
+      roic: toNum(choose(i.roic, b.roic), null)
+    };
+  });
+}
+
+function buildUnifiedTTM(incomeTtmRaw, balanceTtmRaw, cashTtmRaw) {
+  const i = firstObject(incomeTtmRaw) || {};
+  const b = firstObject(balanceTtmRaw) || {};
+  const c = firstObject(cashTtmRaw) || {};
+
+  const revenue = toNum(choose(i.revenue), null);
+  const ebit = toNum(choose(i.operatingIncome, i.ebit), null);
+  const netIncome = toNum(choose(i.netIncome), null);
+  const epsGaap = toNum(choose(i.eps, i.epsdiluted, i.epsDiluted), null);
+  const epsNonGaap = toNum(choose(i.epsdiluted, i.epsDiluted, i.eps), null);
+  const cfo = toNum(choose(
+    c.netCashProvidedByOperatingActivities,
+    c.operatingCashFlow,
+    c.cashFlowFromOperations
+  ), null);
+  const capexRaw = toNum(choose(c.capitalExpenditure, c.capex), null);
+  const capex = capexRaw === null ? null : safeAbsCapex(capexRaw);
+  const fcff = (cfo !== null && capex !== null) ? (cfo - capex) : null;
+
+  return {
+    fiscal_period: "TTM",
+    fiscal_year: null,
+    period_type: "ttm",
+    period_end: choose(i.date, b.date, c.date, null),
+    filing_date: choose(i.fillingDate, b.fillingDate, c.fillingDate, null),
+    revenue,
+    gross_profit: toNum(choose(i.grossProfit), null),
+    ebit,
+    ebitda: toNum(choose(i.ebitda), null),
+    net_income: netIncome,
+    eps_gaap: epsGaap,
+    eps_nongaap: epsNonGaap,
+    cfo,
+    capex,
+    fcff,
+    cash: toNum(choose(
+      b.cashAndCashEquivalents,
+      b.cashAndCashEquivalentsAtCarryingValue,
+      b.cashAndShortTermInvestments
+    ), null),
+    debt: toNum(choose(
+      b.totalDebt,
+      b.shortTermDebt,
+      b.longTermDebt
+    ), null),
+    net_cash: (() => {
+      const cash = toNum(choose(
+        b.cashAndCashEquivalents,
+        b.cashAndCashEquivalentsAtCarryingValue,
+        b.cashAndShortTermInvestments
+      ), null);
+      const debt = toNum(choose(
+        b.totalDebt,
+        b.shortTermDebt,
+        b.longTermDebt
+      ), null);
+      return (cash !== null && debt !== null) ? (cash - debt) : null;
+    })(),
+    diluted_shares: toNum(choose(
+      i.weightedAverageShsOutDil,
+      i.weightedAverageShsOut,
+      i.weightedAverageSharesDiluted
+    ), null),
+    gross_margin: revenue !== null && toNum(choose(i.grossProfit), null) !== null && revenue !== 0
+      ? toNum(choose(i.grossProfit), null) / revenue
+      : null,
+    ebit_margin: revenue !== null && ebit !== null && revenue !== 0 ? ebit / revenue : null,
+    fcf_margin: revenue !== null && fcff !== null && revenue !== 0 ? fcff / revenue : null,
+    roe: toNum(choose(i.roe, b.roe), null),
+    roic: toNum(choose(i.roic, b.roic), null)
+  };
+}
+
 app.post("/v1/classify-instrument", (req, res) => {
   const symbol = (req.body.symbol || "").toUpperCase().trim();
   if (!symbol) {
@@ -384,13 +588,11 @@ app.post("/v1/market-price-pack", async (req, res) => {
   const fromSec = nowSec - historyYears * 365 * 24 * 60 * 60;
 
   let finnhubQuote = null;
-  let finnhubProfile = null;
-  let finnhubOHLCV = [];
   let fmpProfile = null;
+  let finnhubOHLCV = [];
   let fmpOHLCV = [];
   let marketstackOHLCV = [];
 
-  // 1) Finnhub quote/profile as primary snapshot
   try {
     const [quote, profile] = await Promise.all([
       finnhubGet("/quote", { symbol }),
@@ -398,19 +600,16 @@ app.post("/v1/market-price-pack", async (req, res) => {
     ]);
 
     const priceCurrent = toNum(quote?.c, null);
-
     if (priceCurrent === null) {
       throw new Error("finnhub quote missing c");
     }
 
     finnhubQuote = quote;
-    finnhubProfile = profile || null;
     sourceStatus.push({ provider: "finnhub", status: "ok", note: "finnhub quote/profile loaded" });
   } catch (e) {
     sourceStatus.push({ provider: "finnhub", status: "partial", note: `finnhub quote/profile unavailable: ${e.message}` });
   }
 
-  // 2) Finnhub candles try, but no longer mandatory
   try {
     const candles = await finnhubGet("/stock/candle", {
       symbol,
@@ -434,7 +633,6 @@ app.post("/v1/market-price-pack", async (req, res) => {
     sourceStatus.push({ provider: "finnhub_candles", status: "partial", note: `finnhub candles unavailable: ${e.message}` });
   }
 
-  // 3) FMP stable profile + historical daily fallback
   try {
     const [profileData, historicalData] = await Promise.all([
       fmpStableGet("profile", { symbol }),
@@ -459,7 +657,6 @@ app.post("/v1/market-price-pack", async (req, res) => {
     sourceStatus.push({ provider: "fmp", status: "partial", note: `fmp stable fallback unavailable: ${e.message}` });
   }
 
-  // 4) Marketstack historical EOD as second history fallback
   try {
     if (!MARKETSTACK_ACCESS_KEY) {
       throw new Error("MARKETSTACK_ACCESS_KEY missing");
@@ -487,7 +684,6 @@ app.post("/v1/market-price-pack", async (req, res) => {
     sourceStatus.push({ provider: "marketstack", status: "partial", note: `marketstack fallback unavailable: ${e.message}` });
   }
 
-  // 5) choose best available price snapshot
   let priceCurrent = toNum(finnhubQuote?.c, null);
   if (priceCurrent === null && fmpProfile) {
     priceCurrent = toNum(fmpProfile.price, null);
@@ -496,7 +692,6 @@ app.post("/v1/market-price-pack", async (req, res) => {
     }
   }
 
-  // 6) choose best available OHLCV
   let ohlcv = [];
   if (finnhubOHLCV.length > 0) {
     ohlcv = finnhubOHLCV;
@@ -507,7 +702,6 @@ app.post("/v1/market-price-pack", async (req, res) => {
     warnings.push("Using Marketstack EOD fallback for OHLCV.");
   }
 
-  // 7) Alpha final fallback only if still empty
   if (ohlcv.length === 0 && ALPHAVANTAGE_API_KEY) {
     try {
       const dailyRaw = await alphaGet({
@@ -573,61 +767,102 @@ app.post("/v1/market-price-pack", async (req, res) => {
   }, sourceStatus, warnings));
 });
 
-/*
-  Remaining endpoints stay mock in this step.
-*/
-
-app.post("/v1/fundamental-actuals-pack", (req, res) => {
+app.post("/v1/fundamental-actuals-pack", async (req, res) => {
   const symbol = (req.body.symbol || "").toUpperCase().trim();
+  const annualYears = Math.max(1, Math.min(10, Number(req.body.annual_years || 10)));
+  const quarterlyPeriods = Math.max(1, Math.min(12, Number(req.body.quarterly_periods || 12)));
+  const includeTtm = req.body.include_ttm !== false;
+
   if (!symbol) {
     return res.status(400).json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
   }
 
-  return res.json(success({
-    annuals: [
-      {
-        fiscal_period: "FY2025",
-        fiscal_year: 2025,
-        period_type: "annual",
-        period_end: "2025-06-30",
-        filing_date: "2025-08-01",
-        revenue: 260000000000,
-        gross_profit: 178000000000,
-        ebit: 109000000000,
-        ebitda: 125000000000,
-        net_income: 93000000000,
-        eps_gaap: 12.5,
-        eps_nongaap: 13.2,
-        cfo: 118000000000,
-        capex: 17000000000,
-        fcff: 101000000000,
-        cash: 92000000000,
-        debt: 46000000000,
-        net_cash: 46000000000,
-        diluted_shares: 7440000000,
-        gross_margin: 0.68,
-        ebit_margin: 0.42,
-        fcf_margin: 0.39,
-        roe: 0.31,
-        roic: 0.24
-      }
-    ],
-    quarterlies: [],
-    ttm: {
-      fiscal_period: "TTM",
-      period_type: "ttm",
-      revenue: 268000000000,
-      ebit: 112000000000,
-      net_income: 95500000000,
-      eps_gaap: 12.8,
-      eps_nongaap: 13.6,
-      cfo: 121000000000,
-      capex: 18000000000,
-      fcff: 103000000000
-    }
-  }, [
-    { provider: "mock", status: "ok", note: "fundamental pack still mock in phase 1" }
-  ]));
+  const sourceStatus = [];
+  const warnings = [];
+
+  try {
+    const [
+      incomeAnnual,
+      balanceAnnual,
+      cashAnnual,
+      incomeQuarter,
+      balanceQuarter,
+      cashQuarter,
+      incomeTtm,
+      balanceTtm,
+      cashTtm
+    ] = await Promise.all([
+      fmpStableGet("income-statement", { symbol, limit: annualYears, period: "annual" }),
+      fmpStableGet("balance-sheet-statement", { symbol, limit: annualYears, period: "annual" }),
+      fmpStableGet("cash-flow-statement", { symbol, limit: annualYears, period: "annual" }),
+      fmpStableGet("income-statement", { symbol, limit: quarterlyPeriods, period: "quarter" }),
+      fmpStableGet("balance-sheet-statement", { symbol, limit: quarterlyPeriods, period: "quarter" }),
+      fmpStableGet("cash-flow-statement", { symbol, limit: quarterlyPeriods, period: "quarter" }),
+      includeTtm ? fmpStableGet("income-statement-ttm", { symbol }) : Promise.resolve(null),
+      includeTtm ? fmpStableGet("balance-sheet-statement-ttm", { symbol }) : Promise.resolve(null),
+      includeTtm ? fmpStableGet("cash-flow-statement-ttm", { symbol }) : Promise.resolve(null)
+    ]);
+
+    const annuals = buildUnifiedPeriods(
+      firstArrayOrEmpty(incomeAnnual).slice(0, annualYears),
+      firstArrayOrEmpty(balanceAnnual).slice(0, annualYears),
+      firstArrayOrEmpty(cashAnnual).slice(0, annualYears),
+      "annual"
+    );
+
+    const quarterlies = buildUnifiedPeriods(
+      firstArrayOrEmpty(incomeQuarter).slice(0, quarterlyPeriods),
+      firstArrayOrEmpty(balanceQuarter).slice(0, quarterlyPeriods),
+      firstArrayOrEmpty(cashQuarter).slice(0, quarterlyPeriods),
+      "quarterly"
+    );
+
+    const ttm = includeTtm
+      ? buildUnifiedTTM(incomeTtm, balanceTtm, cashTtm)
+      : {
+          fiscal_period: "TTM",
+          fiscal_year: null,
+          period_type: "ttm",
+          period_end: null,
+          filing_date: null,
+          revenue: null,
+          gross_profit: null,
+          ebit: null,
+          ebitda: null,
+          net_income: null,
+          eps_gaap: null,
+          eps_nongaap: null,
+          cfo: null,
+          capex: null,
+          fcff: null,
+          cash: null,
+          debt: null,
+          net_cash: null,
+          diluted_shares: null,
+          gross_margin: null,
+          ebit_margin: null,
+          fcf_margin: null,
+          roe: null,
+          roic: null
+        };
+
+    sourceStatus.push({ provider: "fmp", status: "ok", note: "fmp stable financial statements loaded" });
+
+    return res.json(success({
+      annuals,
+      quarterlies,
+      ttm
+    }, sourceStatus, warnings));
+  } catch (e) {
+    sourceStatus.push({ provider: "fmp", status: "partial", note: `fmp stable financial statements unavailable: ${e.message}` });
+    return res.status(502).json(fail(
+      "ALL_PROVIDERS_UNAVAILABLE",
+      "Unable to assemble usable fundamental actuals from FMP stable endpoints.",
+      502,
+      sourceStatus,
+      warnings
+    ));
+  }
 });
 
 app.post("/v1/estimates-targets-pack", (req, res) => {
@@ -755,7 +990,7 @@ app.get("/", (req, res) => {
     live_phase: {
       security_master: true,
       market_price_pack: true,
-      fundamental_actuals_pack: false,
+      fundamental_actuals_pack: true,
       estimates_targets_pack: false,
       macro_breadth_liquidity_pack: false,
       filings_transcripts_pack: false,
