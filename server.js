@@ -1,24 +1,29 @@
 const express = require("express");
-const app = express();
+const axios = require("axios");
 
+const app = express();
 app.use(express.json());
 
-const success = (data, sourceStatus = []) => ({
+const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY || "";
+const ALPHAVANTAGE_API_KEY = process.env.ALPHAVANTAGE_API_KEY || "";
+const FMP_API_KEY = process.env.FMP_API_KEY || "";
+
+const success = (data, sourceStatus = [], warnings = []) => ({
   meta: {
     request_id: `req_${Date.now()}`,
     generated_at: new Date().toISOString(),
     source_status: sourceStatus,
-    warnings: []
+    warnings
   },
   data
 });
 
-const fail = (code, message, httpStatus = 400, sourceStatus = []) => ({
+const fail = (code, message, httpStatus = 400, sourceStatus = [], warnings = []) => ({
   meta: {
     request_id: `req_${Date.now()}`,
     generated_at: new Date().toISOString(),
     source_status: sourceStatus,
-    warnings: []
+    warnings
   },
   error: {
     http_status: httpStatus,
@@ -28,12 +33,20 @@ const fail = (code, message, httpStatus = 400, sourceStatus = []) => ({
   }
 });
 
-app.post("/v1/classify-instrument", (req, res) => {
-  const symbol = (req.body.symbol || "").toUpperCase().trim();
-  if (!symbol) {
-    return res.status(400).json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
-  }
+const isNonEmpty = (v) => v !== null && v !== undefined && v !== "";
+const toNum = (v, fallback = null) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+};
 
+const knownFiscalYearEnd = {
+  MSFT: "06-30",
+  BABA: "03-31",
+  QQQ: "12-31",
+  GLD: "12-31"
+};
+
+const classifyLocal = (symbol) => {
   let instrument_type = "us_equity";
   let framework_id = "equity_core";
 
@@ -51,6 +64,106 @@ app.post("/v1/classify-instrument", (req, res) => {
     framework_id = "crypto_core";
   }
 
+  return { instrument_type, framework_id };
+};
+
+async function finnhubGet(path, params = {}) {
+  if (!FINNHUB_API_KEY) throw new Error("FINNHUB_API_KEY missing");
+  const resp = await axios.get(`https://finnhub.io/api/v1${path}`, {
+    params: { ...params, token: FINNHUB_API_KEY },
+    timeout: 15000
+  });
+  return resp.data;
+}
+
+async function alphaGet(params = {}) {
+  if (!ALPHAVANTAGE_API_KEY) throw new Error("ALPHAVANTAGE_API_KEY missing");
+  const resp = await axios.get("https://www.alphavantage.co/query", {
+    params: { ...params, apikey: ALPHAVANTAGE_API_KEY },
+    timeout: 15000
+  });
+  return resp.data;
+}
+
+async function fmpGet(path, params = {}) {
+  if (!FMP_API_KEY) throw new Error("FMP_API_KEY missing");
+  const resp = await axios.get(`https://financialmodelingprep.com${path}`, {
+    params: { ...params, apikey: FMP_API_KEY },
+    timeout: 15000
+  });
+  return resp.data;
+}
+
+function mapFinnhubProfileToSecurityMaster(symbol, profile, fmpProfile = null) {
+  const { framework_id } = classifyLocal(symbol);
+  const is_adr = framework_id === "adr_equity_core";
+  const adr_ratio = symbol === "BABA" ? 8.0 : null;
+
+  return {
+    symbol,
+    security_name: profile?.name || fmpProfile?.companyName || symbol,
+    exchange: profile?.exchange || fmpProfile?.exchangeShortName || "",
+    country: profile?.country || fmpProfile?.country || "",
+    sector: fmpProfile?.sector || profile?.finnhubIndustry || "",
+    industry: fmpProfile?.industry || profile?.finnhubIndustry || "",
+    trading_currency: profile?.currency || "USD",
+    reporting_currency: profile?.currency || "USD",
+    fiscal_year_end: knownFiscalYearEnd[symbol] || "12-31",
+    is_adr,
+    adr_ratio,
+    framework_id
+  };
+}
+
+function buildFinnhubOHLCV(candles) {
+  if (!candles || candles.s !== "ok" || !Array.isArray(candles.t)) return [];
+  const out = [];
+  for (let i = 0; i < candles.t.length; i++) {
+    out.push({
+      ts: new Date(candles.t[i] * 1000).toISOString(),
+      open: toNum(candles.o?.[i], 0),
+      high: toNum(candles.h?.[i], 0),
+      low: toNum(candles.l?.[i], 0),
+      close: toNum(candles.c?.[i], 0),
+      volume: toNum(candles.v?.[i], 0)
+    });
+  }
+  return out;
+}
+
+function buildAlphaOHLCV(alphaSeries, maxPoints = 120) {
+  if (!alphaSeries || typeof alphaSeries !== "object") return [];
+  const dates = Object.keys(alphaSeries).sort().slice(-maxPoints);
+  return dates.map((d) => ({
+    ts: new Date(`${d}T00:00:00Z`).toISOString(),
+    open: toNum(alphaSeries[d]["1. open"], 0),
+    high: toNum(alphaSeries[d]["2. high"], 0),
+    low: toNum(alphaSeries[d]["3. low"], 0),
+    close: toNum(alphaSeries[d]["4. close"], 0),
+    volume: toNum(alphaSeries[d]["5. volume"], 0)
+  }));
+}
+
+function mapAlphaQuote(alphaQuoteRaw) {
+  const q = alphaQuoteRaw?.["Global Quote"] || {};
+  return {
+    c: toNum(q["05. price"], null),
+    h: toNum(q["03. high"], null),
+    l: toNum(q["04. low"], null),
+    o: toNum(q["02. open"], null),
+    pc: toNum(q["08. previous close"], null),
+    t: Math.floor(Date.now() / 1000)
+  };
+}
+
+app.post("/v1/classify-instrument", (req, res) => {
+  const symbol = (req.body.symbol || "").toUpperCase().trim();
+  if (!symbol) {
+    return res.status(400).json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
+  }
+
+  const { instrument_type, framework_id } = classifyLocal(symbol);
+
   return res.json(success({
     symbol,
     canonical_symbol: symbol,
@@ -59,130 +172,211 @@ app.post("/v1/classify-instrument", (req, res) => {
     confidence_score: 0.98,
     needs_user_confirmation: false
   }, [
-    { provider: "mock", status: "ok", note: "mock classification used" }
+    { provider: "local-router", status: "ok", note: "local classification used" }
   ]));
 });
 
-app.post("/v1/security-master", (req, res) => {
+app.post("/v1/security-master", async (req, res) => {
   const symbol = (req.body.symbol || "").toUpperCase().trim();
   if (!symbol) {
     return res.status(400).json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
   }
 
-  const map = {
-    MSFT: {
-      symbol: "MSFT",
-      security_name: "Microsoft Corporation",
-      exchange: "NASDAQ",
-      country: "United States",
-      sector: "Technology",
-      industry: "Software",
-      trading_currency: "USD",
-      reporting_currency: "USD",
-      fiscal_year_end: "06-30",
-      is_adr: false,
-      adr_ratio: null,
-      framework_id: "equity_core"
-    },
-    BABA: {
-      symbol: "BABA",
-      security_name: "Alibaba Group Holding Limited",
-      exchange: "NYSE",
-      country: "China",
-      sector: "Consumer Discretionary",
-      industry: "Internet Retail",
-      trading_currency: "USD",
-      reporting_currency: "CNY",
-      fiscal_year_end: "03-31",
-      is_adr: true,
-      adr_ratio: 8.0,
-      framework_id: "adr_equity_core"
-    },
-    QQQ: {
-      symbol: "QQQ",
-      security_name: "Invesco QQQ Trust",
-      exchange: "NASDAQ",
-      country: "United States",
-      sector: "ETF",
-      industry: "Large Cap Growth ETF",
-      trading_currency: "USD",
-      reporting_currency: "USD",
-      fiscal_year_end: "12-31",
-      is_adr: false,
-      adr_ratio: null,
-      framework_id: "etf_core"
-    },
-    GLD: {
-      symbol: "GLD",
-      security_name: "SPDR Gold Shares",
-      exchange: "NYSE Arca",
-      country: "United States",
-      sector: "Commodity ETF",
-      industry: "Gold",
-      trading_currency: "USD",
-      reporting_currency: "USD",
-      fiscal_year_end: "12-31",
-      is_adr: false,
-      adr_ratio: null,
-      framework_id: "commodity_etf_core"
-    }
-  };
+  const sourceStatus = [];
+  const warnings = [];
+  let fmpProfile = null;
 
-  const data = map[symbol] || {
-    symbol,
-    security_name: `${symbol} Mock Security`,
-    exchange: "NASDAQ",
-    country: "United States",
-    sector: "Technology",
-    industry: "Software",
-    trading_currency: "USD",
-    reporting_currency: "USD",
-    fiscal_year_end: "12-31",
-    is_adr: false,
-    adr_ratio: null,
-    framework_id: "equity_core"
-  };
-
-  return res.json(success(data, [
-    { provider: "mock", status: "ok", note: "mock security master used" }
-  ]));
-});
-
-app.post("/v1/market-price-pack", (req, res) => {
-  const symbol = (req.body.symbol || "").toUpperCase().trim();
-  if (!symbol) {
-    return res.status(400).json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
-  }
-
-  return res.json(success({
-    price_current: 452.37,
-    price_timestamp: new Date().toISOString(),
-    market_cap_current: 3365000000000,
-    enterprise_value_current: 3290000000000,
-    shares_outstanding_current: 7440000000,
-    beta_snapshot: 0.91,
-    ohlcv: [
-      {
-        ts: "2026-03-30T00:00:00Z",
-        open: 449.2,
-        high: 454.6,
-        low: 447.9,
-        close: 452.1,
-        volume: 23123456
-      },
-      {
-        ts: "2026-03-31T00:00:00Z",
-        open: 452.0,
-        high: 455.0,
-        low: 450.1,
-        close: 453.8,
-        volume: 20111234
+  try {
+    if (FMP_API_KEY) {
+      const fmpData = await fmpGet(`/api/v3/profile/${symbol}`);
+      if (Array.isArray(fmpData) && fmpData.length > 0) {
+        fmpProfile = fmpData[0];
+        sourceStatus.push({ provider: "fmp", status: "ok", note: "fmp profile fallback/augment loaded" });
       }
-    ]
-  }, [
-    { provider: "mock", status: "ok", note: "mock market pack used" }
-  ]));
+    }
+  } catch (e) {
+    sourceStatus.push({ provider: "fmp", status: "partial", note: "fmp profile unavailable" });
+  }
+
+  try {
+    const profile = await finnhubGet("/stock/profile2", { symbol });
+
+    if (!profile || !profile.name) {
+      throw new Error("Finnhub profile empty");
+    }
+
+    sourceStatus.unshift({ provider: "finnhub", status: "ok", note: "primary profile loaded" });
+
+    return res.json(success(
+      mapFinnhubProfileToSecurityMaster(symbol, profile, fmpProfile),
+      sourceStatus,
+      warnings
+    ));
+  } catch (e) {
+    sourceStatus.unshift({ provider: "finnhub", status: "partial", note: "primary profile unavailable" });
+  }
+
+  if (fmpProfile) {
+    const { framework_id } = classifyLocal(symbol);
+    const is_adr = framework_id === "adr_equity_core";
+    const adr_ratio = symbol === "BABA" ? 8.0 : null;
+
+    return res.json(success({
+      symbol,
+      security_name: fmpProfile.companyName || symbol,
+      exchange: fmpProfile.exchangeShortName || "",
+      country: fmpProfile.country || "",
+      sector: fmpProfile.sector || "",
+      industry: fmpProfile.industry || "",
+      trading_currency: fmpProfile.currency || "USD",
+      reporting_currency: fmpProfile.currency || "USD",
+      fiscal_year_end: knownFiscalYearEnd[symbol] || "12-31",
+      is_adr,
+      adr_ratio,
+      framework_id
+    }, sourceStatus, ["Primary source unavailable, using FMP fallback for security master."]));
+  }
+
+  return res.status(502).json(fail(
+    "ALL_PROVIDERS_UNAVAILABLE",
+    "Unable to load security master from Finnhub/FMP.",
+    502,
+    sourceStatus
+  ));
 });
+
+app.post("/v1/market-price-pack", async (req, res) => {
+  const symbol = (req.body.symbol || "").toUpperCase().trim();
+  const historyYears = Math.max(1, Math.min(10, Number(req.body.history_years || 1)));
+  if (!symbol) {
+    return res.status(400).json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
+  }
+
+  const sourceStatus = [];
+  const warnings = [];
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  const fromSec = nowSec - historyYears * 365 * 24 * 60 * 60;
+
+  let fmpProfile = null;
+  try {
+    if (FMP_API_KEY) {
+      const fmpData = await fmpGet(`/api/v3/profile/${symbol}`);
+      if (Array.isArray(fmpData) && fmpData.length > 0) {
+        fmpProfile = fmpData[0];
+        sourceStatus.push({ provider: "fmp", status: "ok", note: "fmp profile augment loaded" });
+      }
+    }
+  } catch (e) {
+    sourceStatus.push({ provider: "fmp", status: "partial", note: "fmp profile unavailable" });
+  }
+
+  try {
+    const [quote, profile, candles] = await Promise.all([
+      finnhubGet("/quote", { symbol }),
+      finnhubGet("/stock/profile2", { symbol }),
+      finnhubGet("/stock/candle", {
+        symbol,
+        resolution: "D",
+        from: fromSec,
+        to: nowSec
+      })
+    ]);
+
+    if (!quote || !isNonEmpty(quote.c)) {
+      throw new Error("Finnhub quote empty");
+    }
+
+    const ohlcv = buildFinnhubOHLCV(candles);
+    const sharesOutstanding =
+      isNonEmpty(fmpProfile?.sharesOutstanding)
+        ? toNum(fmpProfile.sharesOutstanding, 0)
+        : isNonEmpty(profile?.shareOutstanding)
+          ? toNum(profile.shareOutstanding, 0) * 1000000
+          : 0;
+
+    const marketCap =
+      isNonEmpty(fmpProfile?.mktCap)
+        ? toNum(fmpProfile.mktCap, 0)
+        : sharesOutstanding > 0
+          ? sharesOutstanding * toNum(quote.c, 0)
+          : 0;
+
+    const beta =
+      isNonEmpty(fmpProfile?.beta) ? toNum(fmpProfile.beta, 0) : 0;
+
+    sourceStatus.unshift({ provider: "finnhub", status: "ok", note: "primary quote/profile/candles loaded" });
+
+    return res.json(success({
+      price_current: toNum(quote.c, 0),
+      price_timestamp: quote.t ? new Date(quote.t * 1000).toISOString() : new Date().toISOString(),
+      market_cap_current: marketCap,
+      enterprise_value_current: marketCap,
+      shares_outstanding_current: sharesOutstanding,
+      beta_snapshot: beta,
+      ohlcv
+    }, sourceStatus, warnings));
+  } catch (e) {
+    sourceStatus.unshift({ provider: "finnhub", status: "partial", note: "primary market pack unavailable" });
+    warnings.push("Finnhub market pack unavailable, attempting Alpha fallback.");
+  }
+
+  try {
+    const [quoteRaw, dailyRaw] = await Promise.all([
+      alphaGet({ function: "GLOBAL_QUOTE", symbol }),
+      alphaGet({ function: "TIME_SERIES_DAILY", symbol, outputsize: "compact" })
+    ]);
+
+    const quote = mapAlphaQuote(quoteRaw);
+    const ohlcv = buildAlphaOHLCV(dailyRaw?.["Time Series (Daily)"], 120);
+
+    const sharesOutstanding =
+      isNonEmpty(fmpProfile?.sharesOutstanding)
+        ? toNum(fmpProfile.sharesOutstanding, 0)
+        : 0;
+
+    const marketCap =
+      isNonEmpty(fmpProfile?.mktCap)
+        ? toNum(fmpProfile.mktCap, 0)
+        : sharesOutstanding > 0 && isNonEmpty(quote.c)
+          ? sharesOutstanding * toNum(quote.c, 0)
+          : 0;
+
+    const beta =
+      isNonEmpty(fmpProfile?.beta) ? toNum(fmpProfile.beta, 0) : 0;
+
+    sourceStatus.push({ provider: "alpha_vantage", status: "ok", note: "alpha quote/daily fallback loaded" });
+
+    return res.json(success({
+      price_current: toNum(quote.c, 0),
+      price_timestamp: new Date().toISOString(),
+      market_cap_current: marketCap,
+      enterprise_value_current: marketCap,
+      shares_outstanding_current: sharesOutstanding,
+      beta_snapshot: beta,
+      ohlcv
+    }, sourceStatus, warnings));
+  } catch (e) {
+    sourceStatus.push({ provider: "alpha_vantage", status: "partial", note: "alpha fallback unavailable" });
+  }
+
+  return res.status(502).json(fail(
+    "ALL_PROVIDERS_UNAVAILABLE",
+    "Unable to load market pack from Finnhub/Alpha.",
+    502,
+    sourceStatus,
+    warnings
+  ));
+});
+
+/*
+  The next four endpoints remain mock on purpose in this phase.
+  We are replacing the two lowest-risk, highest-value live data paths first:
+  security-master + market-price-pack.
+  After this is stable, we will live-wire:
+  - fundamental-actuals-pack
+  - estimates-targets-pack
+*/
 
 app.post("/v1/fundamental-actuals-pack", (req, res) => {
   const symbol = (req.body.symbol || "").toUpperCase().trim();
@@ -233,16 +427,14 @@ app.post("/v1/fundamental-actuals-pack", (req, res) => {
       fcff: 103000000000
     }
   }, [
-    { provider: "mock", status: "ok", note: "mock fundamental pack used" }
+    { provider: "mock", status: "ok", note: "fundamental pack still mock in phase 1" }
   ]));
 });
 
 app.post("/v1/estimates-targets-pack", (req, res) => {
   const symbol = (req.body.symbol || "").toUpperCase().trim();
   if (!symbol) {
-    return res
-      .status(400)
-      .json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
+    return res.status(400).json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
   }
 
   const map = {
@@ -314,19 +506,15 @@ app.post("/v1/estimates-targets-pack", (req, res) => {
     estimate_revision_direction: "flat"
   };
 
-  return res.json(
-    success(data, [
-      { provider: "mock", status: "ok", note: "mock estimates and target price used" }
-    ])
-  );
+  return res.json(success(data, [
+    { provider: "mock", status: "ok", note: "estimates pack still mock in phase 1" }
+  ]));
 });
 
 app.post("/v1/macro-breadth-liquidity-pack", (req, res) => {
   const symbol = (req.body.symbol || "").toUpperCase().trim();
   if (!symbol) {
-    return res
-      .status(400)
-      .json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
+    return res.status(400).json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
   }
 
   const defaultData = {
@@ -386,442 +574,33 @@ app.post("/v1/macro-breadth-liquidity-pack", (req, res) => {
 
   const data = map[symbol] || defaultData;
 
-  return res.json(
-    success(data, [
-      { provider: "mock", status: "ok", note: "mock macro breadth liquidity pack used" }
-    ])
-  );
+  return res.json(success(data, [
+    { provider: "mock", status: "ok", note: "macro pack still mock in phase 1" }
+  ]));
 });
 
 app.post("/v1/filings-transcripts-pack", (req, res) => {
   const symbol = (req.body.symbol || "").toUpperCase().trim();
   if (!symbol) {
-    return res
-      .status(400)
-      .json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
+    return res.status(400).json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
   }
 
-  const map = {
-    MSFT: {
-      filings: [
-        {
-          form_type: "10-K",
-          filing_date: "2025-08-01",
-          period_end: "2025-06-30",
-          source_url: "https://www.sec.gov/",
-          title: "Annual report"
-        },
-        {
-          form_type: "10-Q",
-          filing_date: "2025-10-28",
-          period_end: "2025-09-30",
-          source_url: "https://www.sec.gov/",
-          title: "Quarterly report"
-        }
-      ],
-      transcripts: [
-        {
-          event_date: "2026-01-28",
-          fiscal_label: "Q2 FY2026",
-          source_url: "https://example.com/transcript/msft-q2fy26",
-          provider_label: "mock"
-        }
-      ],
-      guidance_notes: [
-        "Management commentary emphasizes Azure and AI monetization.",
-        "Capital spending remains elevated but tied to AI infrastructure expansion."
-      ]
-    },
-    BABA: {
-      filings: [
-        {
-          form_type: "20-F",
-          filing_date: "2025-07-18",
-          period_end: "2025-03-31",
-          source_url: "https://www.sec.gov/",
-          title: "Annual report"
-        },
-        {
-          form_type: "6-K",
-          filing_date: "2026-02-07",
-          period_end: "2025-12-31",
-          source_url: "https://www.sec.gov/",
-          title: "Other report"
-        }
-      ],
-      transcripts: [
-        {
-          event_date: "2026-02-07",
-          fiscal_label: "FY2026 Q3",
-          source_url: "https://example.com/transcript/baba-fy26q3",
-          provider_label: "mock"
-        }
-      ],
-      guidance_notes: [
-        "ADR / FX effects should be separated from underlying operating growth.",
-        "Foreign private issuer cadence follows 20-F / 6-K regime."
-      ]
-    },
-    QQQ: {
-      filings: [
-        {
-          form_type: "Prospectus/ETF disclosure",
-          filing_date: "2025-12-01",
-          period_end: null,
-          source_url: "https://www.invesco.com/",
-          title: "Product disclosure / prospectus update"
-        }
-      ],
-      transcripts: [],
-      guidance_notes: [
-        "ETF framework: do not treat disclosures as company management earnings guidance.",
-        "Use holdings, structure, fees, market breadth and macro sensitivity instead."
-      ]
-    },
-    GLD: {
-      filings: [
-        {
-          form_type: "Trust/ETF disclosure",
-          filing_date: "2025-12-01",
-          period_end: null,
-          source_url: "https://www.ssga.com/",
-          title: "Product disclosure"
-        }
-      ],
-      transcripts: [],
-      guidance_notes: [
-        "Commodity ETF framework: focus on structure, fees, real rates, USD and underlying commodity."
-      ]
-    }
-  };
-
-  const data = map[symbol] || {
-    filings: [
-      {
-        form_type: "10-K",
-        filing_date: "2025-08-01",
-        period_end: "2025-06-30",
-        source_url: "https://www.sec.gov/",
-        title: "Annual report"
-      }
-    ],
+  return res.json(success({
+    filings: [],
     transcripts: [],
-    guidance_notes: [
-      "Mock filing pack used. Replace with live SEC / transcript data later."
-    ]
-  };
-
-  return res.json(
-    success(data, [
-      { provider: "mock", status: "ok", note: "mock filings and transcripts used" }
-    ])
-  );
+    guidance_notes: ["filings/transcripts pack still mock in phase 1"]
+  }, [
+    { provider: "mock", status: "ok", note: "filings/transcripts pack still mock in phase 1" }
+  ]));
 });
 
 app.post("/v1/technical-structure-pack", (req, res) => {
   const symbol = (req.body.symbol || "").toUpperCase().trim();
   if (!symbol) {
-    return res
-      .status(400)
-      .json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
+    return res.status(400).json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
   }
 
-  const map = {
-    MSFT: {
-      trend_state: "daily_uptrend_weekly_consolidation",
-      momentum_state: "moderately_positive",
-      structure_tags: [
-        "near_prior_breakout_zone",
-        "weekly_consolidation",
-        "no_confirmed_exhaustion"
-      ],
-      key_dates: ["2026-03-12", "2026-03-26"],
-      indicators: {
-        ma20: 447.5,
-        ma50: 438.9,
-        ma200: 401.2,
-        rsi14: 59.4,
-        macd: 3.12,
-        atr: 7.65
-      },
-      support_resistance: [
-        {
-          kind: "support",
-          low: 444.0,
-          high: 447.0,
-          strength: "strong",
-          basis: ["moving_average", "volume_node"],
-          note: "20DMA and dense traded range overlap"
-        },
-        {
-          kind: "support",
-          low: 436.0,
-          high: 439.0,
-          strength: "medium",
-          basis: ["moving_average", "swing"],
-          note: "50DMA region and prior swing support"
-        },
-        {
-          kind: "support",
-          low: 425.0,
-          high: 429.0,
-          strength: "weak",
-          basis: ["valuation_channel"],
-          note: "lower valuation band area"
-        },
-        {
-          kind: "resistance",
-          low: 455.0,
-          high: 458.0,
-          strength: "strong",
-          basis: ["swing", "valuation_channel"],
-          note: "recent local high and upper valuation band overlap"
-        },
-        {
-          kind: "resistance",
-          low: 465.0,
-          high: 469.0,
-          strength: "medium",
-          basis: ["swing"],
-          note: "higher swing zone"
-        },
-        {
-          kind: "resistance",
-          low: 478.0,
-          high: 482.0,
-          strength: "weak",
-          basis: ["valuation_channel"],
-          note: "extended valuation channel area"
-        }
-      ],
-      valuation_channels_available: true,
-      channel_notes: [
-        "PE band plotted from trailing distribution",
-        "PEG band uses model-imputed growth snapshots"
-      ]
-    },
-    BABA: {
-      trend_state: "daily_rebound_with_weekly_base_building",
-      momentum_state: "neutral_to_positive",
-      structure_tags: [
-        "base_building",
-        "adr_translation_sensitive",
-        "no_confirmed_breakout"
-      ],
-      key_dates: ["2026-03-18", "2026-03-29"],
-      indicators: {
-        ma20: 98.4,
-        ma50: 95.1,
-        ma200: 86.7,
-        rsi14: 54.3,
-        macd: 1.05,
-        atr: 3.48
-      },
-      support_resistance: [
-        {
-          kind: "support",
-          low: 96.0,
-          high: 98.0,
-          strength: "strong",
-          basis: ["moving_average", "volume_node"],
-          note: "20DMA and high participation zone"
-        },
-        {
-          kind: "support",
-          low: 92.0,
-          high: 94.0,
-          strength: "medium",
-          basis: ["swing"],
-          note: "recent swing floor"
-        },
-        {
-          kind: "support",
-          low: 87.0,
-          high: 89.0,
-          strength: "weak",
-          basis: ["valuation_channel"],
-          note: "lower valuation support area"
-        },
-        {
-          kind: "resistance",
-          low: 102.0,
-          high: 104.0,
-          strength: "strong",
-          basis: ["swing", "valuation_channel"],
-          note: "near-term breakout ceiling"
-        },
-        {
-          kind: "resistance",
-          low: 108.0,
-          high: 111.0,
-          strength: "medium",
-          basis: ["swing"],
-          note: "upper swing cluster"
-        },
-        {
-          kind: "resistance",
-          low: 118.0,
-          high: 121.0,
-          strength: "weak",
-          basis: ["valuation_channel"],
-          note: "extended valuation zone"
-        }
-      ],
-      valuation_channels_available: true,
-      channel_notes: [
-        "PE band uses ADR-adjusted EPS assumptions",
-        "PEG band is model-imputed and low-confidence"
-      ]
-    },
-    QQQ: {
-      trend_state: "weekly_uptrend_daily_consolidation",
-      momentum_state: "moderately_positive",
-      structure_tags: [
-        "narrow_leadership",
-        "daily_consolidation",
-        "trend_intact"
-      ],
-      key_dates: ["2026-03-14", "2026-03-27"],
-      indicators: {
-        ma20: 518.6,
-        ma50: 507.9,
-        ma200: 472.4,
-        rsi14: 57.1,
-        macd: 4.88,
-        atr: 8.35
-      },
-      support_resistance: [
-        {
-          kind: "support",
-          low: 515.0,
-          high: 519.0,
-          strength: "strong",
-          basis: ["moving_average", "volume_node"],
-          note: "20DMA and dense traded zone"
-        },
-        {
-          kind: "support",
-          low: 505.0,
-          high: 509.0,
-          strength: "medium",
-          basis: ["moving_average", "swing"],
-          note: "50DMA region"
-        },
-        {
-          kind: "support",
-          low: 492.0,
-          high: 496.0,
-          strength: "weak",
-          basis: ["valuation_channel"],
-          note: "lower ETF valuation band proxy"
-        },
-        {
-          kind: "resistance",
-          low: 526.0,
-          high: 530.0,
-          strength: "strong",
-          basis: ["swing", "valuation_channel"],
-          note: "recent local high"
-        },
-        {
-          kind: "resistance",
-          low: 538.0,
-          high: 542.0,
-          strength: "medium",
-          basis: ["swing"],
-          note: "upper breakout zone"
-        },
-        {
-          kind: "resistance",
-          low: 552.0,
-          high: 557.0,
-          strength: "weak",
-          basis: ["valuation_channel"],
-          note: "extended move area"
-        }
-      ],
-      valuation_channels_available: true,
-      channel_notes: [
-        "ETF valuation channel is a proxy layer, not company DCF",
-        "No chip_peak or options_wall included in v1"
-      ]
-    },
-    GLD: {
-      trend_state: "range_bound_with_macro_support",
-      momentum_state: "neutral",
-      structure_tags: [
-        "commodity_macro_sensitive",
-        "range_trade",
-        "no_clean_breakout"
-      ],
-      key_dates: ["2026-03-11", "2026-03-28"],
-      indicators: {
-        ma20: 244.3,
-        ma50: 241.8,
-        ma200: 228.9,
-        rsi14: 51.2,
-        macd: 0.74,
-        atr: 3.16
-      },
-      support_resistance: [
-        {
-          kind: "support",
-          low: 242.0,
-          high: 244.0,
-          strength: "strong",
-          basis: ["moving_average", "volume_node"],
-          note: "20DMA zone"
-        },
-        {
-          kind: "support",
-          low: 238.0,
-          high: 240.0,
-          strength: "medium",
-          basis: ["swing"],
-          note: "recent swing support"
-        },
-        {
-          kind: "support",
-          low: 233.0,
-          high: 235.0,
-          strength: "weak",
-          basis: ["swing"],
-          note: "deeper support area"
-        },
-        {
-          kind: "resistance",
-          low: 247.0,
-          high: 249.0,
-          strength: "strong",
-          basis: ["swing"],
-          note: "range ceiling"
-        },
-        {
-          kind: "resistance",
-          low: 252.0,
-          high: 254.0,
-          strength: "medium",
-          basis: ["swing"],
-          note: "breakout extension level"
-        },
-        {
-          kind: "resistance",
-          low: 259.0,
-          high: 262.0,
-          strength: "weak",
-          basis: ["valuation_channel"],
-          note: "extended commodity valuation proxy"
-        }
-      ],
-      valuation_channels_available: true,
-      channel_notes: [
-        "Commodity ETF channel is macro/price proxy-based",
-        "No chip_peak or options_wall included in v1"
-      ]
-    }
-  };
-
-  const data = map[symbol] || {
+  return res.json(success({
     trend_state: "mixed",
     momentum_state: "neutral",
     structure_tags: ["insufficient_context"],
@@ -853,14 +632,10 @@ app.post("/v1/technical-structure-pack", (req, res) => {
       }
     ],
     valuation_channels_available: false,
-    channel_notes: ["Mock technical pack used"]
-  };
-
-  return res.json(
-    success(data, [
-      { provider: "mock", status: "ok", note: "mock technical structure pack used" }
-    ])
-  );
+    channel_notes: ["technical structure pack still mock in phase 1"]
+  }, [
+    { provider: "mock", status: "ok", note: "technical pack still mock in phase 1" }
+  ]));
 });
 
 app.get("/", (req, res) => {
@@ -876,11 +651,20 @@ app.get("/", (req, res) => {
       "/v1/macro-breadth-liquidity-pack",
       "/v1/filings-transcripts-pack",
       "/v1/technical-structure-pack"
-    ]
+    ],
+    live_phase: {
+      security_master: true,
+      market_price_pack: true,
+      fundamental_actuals_pack: false,
+      estimates_targets_pack: false,
+      macro_breadth_liquidity_pack: false,
+      filings_transcripts_pack: false,
+      technical_structure_pack: false
+    }
   });
 });
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Mock API running on port ${PORT}`);
+  console.log(`API running on port ${PORT}`);
 });
