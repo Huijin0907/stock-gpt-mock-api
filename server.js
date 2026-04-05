@@ -8,7 +8,9 @@ const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY || "";
 const ALPHAVANTAGE_API_KEY = process.env.ALPHAVANTAGE_API_KEY || "";
 const FMP_API_KEY = process.env.FMP_API_KEY || "";
 const MARKETSTACK_ACCESS_KEY = process.env.MARKETSTACK_ACCESS_KEY || "";
-const SEC_USER_AGENT = process.env.SEC_USER_AGENT || "stock-gpt-mock-api/1.0 (+https://stock-gpt-mock-api.onrender.com)";
+const SEC_USER_AGENT =
+  process.env.SEC_USER_AGENT ||
+  "stock-gpt-mock-api/1.0 (+https://stock-gpt-mock-api.onrender.com)";
 
 const ACTUALS_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const SEC_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
@@ -26,6 +28,65 @@ const knownFiscalYearEnd = {
   AAPL: "09-30"
 };
 
+const SEC_ANNUAL_FORMS = new Set([
+  "10-K",
+  "10-K/A",
+  "20-F",
+  "20-F/A",
+  "40-F",
+  "40-F/A"
+]);
+
+const SEC_QUARTERLY_FORMS = new Set([
+  "10-Q",
+  "10-Q/A",
+  "6-K",
+  "6-K/A"
+]);
+
+const SEC_METRIC_TAGS = {
+  revenue: [
+    "RevenueFromContractWithCustomerExcludingAssessedTax",
+    "SalesRevenueNet",
+    "Revenues",
+    "RevenueFromContractWithCustomerIncludingAssessedTax"
+  ],
+  gross_profit: ["GrossProfit"],
+  ebit: ["OperatingIncomeLoss"],
+  net_income: ["NetIncomeLoss", "ProfitLoss"],
+  eps_gaap: ["EarningsPerShareDiluted", "EarningsPerShareBasicAndDiluted"],
+  cfo: [
+    "NetCashProvidedByUsedInOperatingActivities",
+    "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"
+  ],
+  capex: [
+    "PaymentsToAcquirePropertyPlantAndEquipment",
+    "PropertyPlantAndEquipmentAdditions"
+  ],
+  cash: [
+    "CashAndCashEquivalentsAtCarryingValue",
+    "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+    "CashCashEquivalentsAndShortTermInvestments"
+  ],
+  debt_total: [
+    "LongTermDebtAndCapitalLeaseObligations",
+    "LongTermDebtAndCapitalLeaseObligationsIncludingCurrentMaturities",
+    "DebtAndFinanceLeaseObligations",
+    "DebtInstrumentFaceAmount"
+  ],
+  debt_current: [
+    "LongTermDebtCurrent",
+    "LongTermDebtAndCapitalLeaseObligationsCurrent",
+    "ShortTermBorrowings"
+  ],
+  debt_noncurrent: [
+    "LongTermDebtNoncurrent",
+    "LongTermDebtAndCapitalLeaseObligationsNoncurrent"
+  ],
+  diluted_shares_duration: ["WeightedAverageNumberOfDilutedSharesOutstanding"],
+  common_shares_outstanding: ["CommonStockSharesOutstanding"]
+};
+
 const success = (data, sourceStatus = [], warnings = []) => ({
   meta: {
     request_id: `req_${Date.now()}`,
@@ -36,7 +97,14 @@ const success = (data, sourceStatus = [], warnings = []) => ({
   data
 });
 
-const fail = (code, message, httpStatus = 400, sourceStatus = [], warnings = [], retryable = false) => ({
+const fail = (
+  code,
+  message,
+  httpStatus = 400,
+  sourceStatus = [],
+  warnings = [],
+  retryable = false
+) => ({
   meta: {
     request_id: `req_${Date.now()}`,
     generated_at: new Date().toISOString(),
@@ -104,15 +172,19 @@ async function alphaGet(params = {}) {
 
 async function fmpStableGet(path, params = {}) {
   if (!FMP_API_KEY) throw new Error("FMP_API_KEY missing");
-  const resp = await axios.get(`https://financialmodelingprep.com/stable/${path}`, {
-    params: { ...params, apikey: FMP_API_KEY },
-    timeout: 15000
-  });
+  const resp = await axios.get(
+    `https://financialmodelingprep.com/stable/${path}`,
+    {
+      params: { ...params, apikey: FMP_API_KEY },
+      timeout: 15000
+    }
+  );
   return resp.data;
 }
 
 async function marketstackGet(path = "eod", params = {}) {
-  if (!MARKETSTACK_ACCESS_KEY) throw new Error("MARKETSTACK_ACCESS_KEY missing");
+  if (!MARKETSTACK_ACCESS_KEY)
+    throw new Error("MARKETSTACK_ACCESS_KEY missing");
   const resp = await axios.get(`https://api.marketstack.com/v1/${path}`, {
     params: { ...params, access_key: MARKETSTACK_ACCESS_KEY },
     timeout: 15000
@@ -124,8 +196,8 @@ async function secGet(url) {
   const resp = await axios.get(url, {
     headers: {
       "User-Agent": SEC_USER_AGENT,
-      "Accept": "application/json, text/plain, */*",
-      "Referer": "https://www.sec.gov/",
+      Accept: "application/json, text/plain, */*",
+      Referer: "https://www.sec.gov/",
       "Accept-Encoding": "gzip, deflate"
     },
     timeout: 20000
@@ -162,7 +234,12 @@ function mapFinnhubProfileToSecurityMaster(symbol, profile, fmpProfile = null) {
 }
 
 function buildFinnhubOHLCV(candles) {
-  if (!candles || candles.s !== "ok" || !Array.isArray(candles.t) || candles.t.length === 0) {
+  if (
+    !candles ||
+    candles.s !== "ok" ||
+    !Array.isArray(candles.t) ||
+    candles.t.length === 0
+  ) {
     return [];
   }
 
@@ -178,15 +255,25 @@ function buildFinnhubOHLCV(candles) {
     });
   }
 
-  return out.filter((x) => x.ts && x.open !== null && x.high !== null && x.low !== null && x.close !== null && x.volume !== null);
+  return out.filter(
+    (x) =>
+      x.ts &&
+      x.open !== null &&
+      x.high !== null &&
+      x.low !== null &&
+      x.close !== null &&
+      x.volume !== null
+  );
 }
 
 function buildFmpOHLCV(payload, maxPoints = 252) {
   let rows = [];
   if (Array.isArray(payload)) rows = payload;
-  else if (payload?.historical && Array.isArray(payload.historical)) rows = payload.historical;
+  else if (payload?.historical && Array.isArray(payload.historical))
+    rows = payload.historical;
   else if (payload?.data && Array.isArray(payload.data)) rows = payload.data;
-  else if (payload?.results && Array.isArray(payload.results)) rows = payload.results;
+  else if (payload?.results && Array.isArray(payload.results))
+    rows = payload.results;
 
   return rows
     .slice(0, maxPoints)
@@ -198,7 +285,15 @@ function buildFmpOHLCV(payload, maxPoints = 252) {
       close: toNum(r.close, null),
       volume: toNum(r.volume, null)
     }))
-    .filter((x) => x.ts && x.open !== null && x.high !== null && x.low !== null && x.close !== null && x.volume !== null)
+    .filter(
+      (x) =>
+        x.ts &&
+        x.open !== null &&
+        x.high !== null &&
+        x.low !== null &&
+        x.close !== null &&
+        x.volume !== null
+    )
     .sort((a, b) => a.ts.localeCompare(b.ts));
 }
 
@@ -214,12 +309,24 @@ function buildMarketstackOHLCV(payload, maxPoints = 252) {
       close: toNum(r.close, null),
       volume: toNum(r.volume, null)
     }))
-    .filter((x) => x.ts && x.open !== null && x.high !== null && x.low !== null && x.close !== null && x.volume !== null)
+    .filter(
+      (x) =>
+        x.ts &&
+        x.open !== null &&
+        x.high !== null &&
+        x.low !== null &&
+        x.close !== null &&
+        x.volume !== null
+    )
     .sort((a, b) => a.ts.localeCompare(b.ts));
 }
 
 function buildAlphaOHLCV(alphaSeries, maxPoints = 120) {
-  if (!alphaSeries || typeof alphaSeries !== "object" || Object.keys(alphaSeries).length === 0) {
+  if (
+    !alphaSeries ||
+    typeof alphaSeries !== "object" ||
+    Object.keys(alphaSeries).length === 0
+  ) {
     return [];
   }
 
@@ -234,7 +341,15 @@ function buildAlphaOHLCV(alphaSeries, maxPoints = 120) {
       close: toNum(alphaSeries[d]["4. close"], null),
       volume: toNum(alphaSeries[d]["5. volume"], null)
     }))
-    .filter((x) => x.ts && x.open !== null && x.high !== null && x.low !== null && x.close !== null && x.volume !== null);
+    .filter(
+      (x) =>
+        x.ts &&
+        x.open !== null &&
+        x.high !== null &&
+        x.low !== null &&
+        x.close !== null &&
+        x.volume !== null
+    );
 }
 
 function formatDateYYYYMMDD(dateObj) {
@@ -246,25 +361,55 @@ function formatDateYYYYMMDD(dateObj) {
 
 function alphaExtractProblem(payload) {
   if (!payload || typeof payload !== "object") return null;
-  const raw = payload?.Note || payload?.Information || payload?.["Error Message"] || null;
+  const raw =
+    payload?.Note || payload?.Information || payload?.["Error Message"] || null;
   if (!raw) return null;
 
   const message = String(raw);
   const lower = message.toLowerCase();
 
   if (payload?.["Error Message"]) {
-    return { code: "ALPHAVANTAGE_UPSTREAM_ERROR", message, httpStatus: 502, retryable: false };
+    return {
+      code: "ALPHAVANTAGE_UPSTREAM_ERROR",
+      message,
+      httpStatus: 502,
+      retryable: false
+    };
   }
   if (lower.includes("per minute")) {
-    return { code: "ALPHAVANTAGE_RATE_LIMIT_PER_MINUTE", message, httpStatus: 429, retryable: true };
+    return {
+      code: "ALPHAVANTAGE_RATE_LIMIT_PER_MINUTE",
+      message,
+      httpStatus: 429,
+      retryable: true
+    };
   }
-  if (lower.includes("25 requests per day") || lower.includes("25 calls per day") || lower.includes("per day")) {
-    return { code: "ALPHAVANTAGE_RATE_LIMIT_PER_DAY", message, httpStatus: 429, retryable: false };
+  if (
+    lower.includes("25 requests per day") ||
+    lower.includes("25 calls per day") ||
+    lower.includes("per day")
+  ) {
+    return {
+      code: "ALPHAVANTAGE_RATE_LIMIT_PER_DAY",
+      message,
+      httpStatus: 429,
+      retryable: false
+    };
   }
   if (lower.includes("premium")) {
-    return { code: "ALPHAVANTAGE_PREMIUM_OR_PLAN_LIMIT", message, httpStatus: 429, retryable: false };
+    return {
+      code: "ALPHAVANTAGE_PREMIUM_OR_PLAN_LIMIT",
+      message,
+      httpStatus: 429,
+      retryable: false
+    };
   }
-  return { code: "ALPHAVANTAGE_NOTE_OR_INFORMATION", message, httpStatus: 502, retryable: false };
+  return {
+    code: "ALPHAVANTAGE_NOTE_OR_INFORMATION",
+    message,
+    httpStatus: 502,
+    retryable: false
+  };
 }
 
 function alphaHasRateLimitOrError(payload) {
@@ -272,20 +417,30 @@ function alphaHasRateLimitOrError(payload) {
 }
 
 function alphaProblemToSourceStatus(provider, problem) {
-  return { provider, status: "partial", note: problem?.message || "alpha returned note/error payload" };
+  return {
+    provider,
+    status: "partial",
+    note: problem?.message || "alpha returned note/error payload"
+  };
 }
 
 function normalizeAlphaReports(payload) {
   return {
     annual: Array.isArray(payload?.annualReports) ? payload.annualReports : [],
-    quarterly: Array.isArray(payload?.quarterlyReports) ? payload.quarterlyReports : []
+    quarterly: Array.isArray(payload?.quarterlyReports)
+      ? payload.quarterlyReports
+      : []
   };
 }
 
 function normalizeAlphaShares(payload) {
   return {
-    annual: Array.isArray(payload?.annualSharesOutstanding) ? payload.annualSharesOutstanding : [],
-    quarterly: Array.isArray(payload?.quarterlySharesOutstanding) ? payload.quarterlySharesOutstanding : []
+    annual: Array.isArray(payload?.annualSharesOutstanding)
+      ? payload.annualSharesOutstanding
+      : [],
+    quarterly: Array.isArray(payload?.quarterlySharesOutstanding)
+      ? payload.quarterlySharesOutstanding
+      : []
   };
 }
 
@@ -305,9 +460,9 @@ function buildAlphaSharesMap(rows) {
     if (!key) continue;
     const diluted = toNum(
       r.dilutedSharesOutstanding ||
-      r.weightedAverageShsOutDil ||
-      r.sharesOutstanding ||
-      r.commonSharesOutstanding,
+        r.weightedAverageShsOutDil ||
+        r.sharesOutstanding ||
+        r.commonSharesOutstanding,
       null
     );
     if (diluted !== null) m.set(key, diluted);
@@ -315,18 +470,28 @@ function buildAlphaSharesMap(rows) {
   return m;
 }
 
-function buildAlphaUnifiedPeriods(incomeRows, balanceRows, cashRows, sharesRows, periodType) {
+function buildAlphaUnifiedPeriods(
+  incomeRows,
+  balanceRows,
+  cashRows,
+  sharesRows,
+  periodType
+) {
   const incomeMap = buildAlphaStatementMapByDate(incomeRows);
   const balanceMap = buildAlphaStatementMapByDate(balanceRows);
   const cashMap = buildAlphaStatementMapByDate(cashRows);
   const sharesMap = buildAlphaSharesMap(sharesRows);
 
-  const keys = Array.from(new Set([
-    ...incomeMap.keys(),
-    ...balanceMap.keys(),
-    ...cashMap.keys(),
-    ...sharesMap.keys()
-  ])).sort().reverse();
+  const keys = Array.from(
+    new Set([
+      ...incomeMap.keys(),
+      ...balanceMap.keys(),
+      ...cashMap.keys(),
+      ...sharesMap.keys()
+    ])
+  )
+    .sort()
+    .reverse();
 
   return keys.map((key) => {
     const i = incomeMap.get(key) || {};
@@ -339,29 +504,44 @@ function buildAlphaUnifiedPeriods(incomeRows, balanceRows, cashRows, sharesRows,
     const ebit = toNum(alphaChoose(i.operatingIncome, i.ebit), null);
     const ebitda = toNum(alphaChoose(i.ebitda, i.EBITDA), null);
     const netIncome = toNum(alphaChoose(i.netIncome), null);
-    const epsGaap = toNum(alphaChoose(i.reportedEPS, i.dilutedEPS, i.eps), null);
+    const epsGaap = toNum(
+      alphaChoose(i.reportedEPS, i.dilutedEPS, i.eps),
+      null
+    );
 
     const cfo = toNum(alphaChoose(c.operatingCashflow, c.operatingCashFlow), null);
-    const capexRaw = toNum(alphaChoose(c.capitalExpenditures, c.capitalExpenditure), null);
+    const capexRaw = toNum(
+      alphaChoose(c.capitalExpenditures, c.capitalExpenditure),
+      null
+    );
     const capex = capexRaw === null ? null : Math.abs(capexRaw);
-    const fcff = (cfo !== null && capex !== null) ? (cfo - capex) : null;
+    const fcff = cfo !== null && capex !== null ? cfo - capex : null;
 
-    const cash = toNum(alphaChoose(
-      b.cashAndCashEquivalentsAtCarryingValue,
-      b.cashAndShortTermInvestments,
-      b.cashAndCashEquivalents
-    ), null);
+    const cash = toNum(
+      alphaChoose(
+        b.cashAndCashEquivalentsAtCarryingValue,
+        b.cashAndShortTermInvestments,
+        b.cashAndCashEquivalents
+      ),
+      null
+    );
 
-    const debt = toNum(alphaChoose(
-      b.shortLongTermDebtTotal,
-      b.longTermDebtNoncurrent,
-      b.currentDebtAndCapitalLeaseObligation
-    ), null);
+    const debt = toNum(
+      alphaChoose(
+        b.shortLongTermDebtTotal,
+        b.longTermDebtNoncurrent,
+        b.currentDebtAndCapitalLeaseObligation
+      ),
+      null
+    );
 
     const fiscalYear = toNum((key || "").slice(0, 4), null);
 
     return {
-      fiscal_period: periodType === "annual" ? `FY${fiscalYear ?? ""}` : alphaChoose(i.fiscalDateEnding, key),
+      fiscal_period:
+        periodType === "annual"
+          ? `FY${fiscalYear ?? ""}`
+          : alphaChoose(i.fiscalDateEnding, key),
       fiscal_year: fiscalYear,
       period_type: periodType,
       period_end: key,
@@ -378,11 +558,20 @@ function buildAlphaUnifiedPeriods(incomeRows, balanceRows, cashRows, sharesRows,
       fcff,
       cash,
       debt,
-      net_cash: (cash !== null && debt !== null) ? (cash - debt) : null,
+      net_cash: cash !== null && debt !== null ? cash - debt : null,
       diluted_shares: dilutedShares,
-      gross_margin: revenue !== null && grossProfit !== null && revenue !== 0 ? grossProfit / revenue : null,
-      ebit_margin: revenue !== null && ebit !== null && revenue !== 0 ? ebit / revenue : null,
-      fcf_margin: revenue !== null && fcff !== null && revenue !== 0 ? fcff / revenue : null,
+      gross_margin:
+        revenue !== null && grossProfit !== null && revenue !== 0
+          ? grossProfit / revenue
+          : null,
+      ebit_margin:
+        revenue !== null && ebit !== null && revenue !== 0
+          ? ebit / revenue
+          : null,
+      fcf_margin:
+        revenue !== null && fcff !== null && revenue !== 0
+          ? fcff / revenue
+          : null,
       roe: null,
       roic: null
     };
@@ -418,14 +607,23 @@ function buildEmptyTtm() {
   };
 }
 
-function buildAlphaTTM(incomeQuarterly, balanceQuarterly, cashQuarterly, sharesQuarterly = []) {
+function buildAlphaTTM(
+  incomeQuarterly,
+  balanceQuarterly,
+  cashQuarterly,
+  sharesQuarterly = []
+) {
   const iq = [...incomeQuarterly].slice(0, 4);
   const cq = [...cashQuarterly].slice(0, 4);
   const b0 = balanceQuarterly[0] || {};
   const sq = sharesQuarterly[0] || {};
 
   const sum = (rows, fieldNames) => {
-    const vals = rows.map((r) => toNum(alphaChoose(...fieldNames.map((f) => r[f])), null)).filter((v) => v !== null);
+    const vals = rows
+      .map((r) =>
+        toNum(alphaChoose(...fieldNames.map((f) => r[f])), null)
+      )
+      .filter((v) => v !== null);
     return vals.length > 0 ? vals.reduce((a, b) => a + b, 0) : null;
   };
 
@@ -438,7 +636,9 @@ function buildAlphaTTM(incomeQuarterly, balanceQuarterly, cashQuarterly, sharesQ
 
   const capexAbs = (() => {
     const vals = cq
-      .map((r) => toNum(alphaChoose(r.capitalExpenditures, r.capitalExpenditure), null))
+      .map((r) =>
+        toNum(alphaChoose(r.capitalExpenditures, r.capitalExpenditure), null)
+      )
       .filter((v) => v !== null)
       .map((v) => Math.abs(v));
     return vals.length > 0 ? vals.reduce((a, b) => a + b, 0) : null;
@@ -446,38 +646,57 @@ function buildAlphaTTM(incomeQuarterly, balanceQuarterly, cashQuarterly, sharesQ
 
   const quarterlyEpsSum = (() => {
     const vals = iq
-      .map((r) => toNum(alphaChoose(r.reportedEPS, r.dilutedEPS, r.eps), null))
+      .map((r) =>
+        toNum(alphaChoose(r.reportedEPS, r.dilutedEPS, r.eps), null)
+      )
       .filter((v) => v !== null);
     return vals.length > 0 ? vals.reduce((a, b) => a + b, 0) : null;
   })();
 
-  const cash = toNum(alphaChoose(
-    b0.cashAndCashEquivalentsAtCarryingValue,
-    b0.cashAndShortTermInvestments,
-    b0.cashAndCashEquivalents
-  ), null);
+  const cash = toNum(
+    alphaChoose(
+      b0.cashAndCashEquivalentsAtCarryingValue,
+      b0.cashAndShortTermInvestments,
+      b0.cashAndCashEquivalents
+    ),
+    null
+  );
 
-  const debt = toNum(alphaChoose(
-    b0.shortLongTermDebtTotal,
-    b0.longTermDebtNoncurrent,
-    b0.currentDebtAndCapitalLeaseObligation
-  ), null);
+  const debt = toNum(
+    alphaChoose(
+      b0.shortLongTermDebtTotal,
+      b0.longTermDebtNoncurrent,
+      b0.currentDebtAndCapitalLeaseObligation
+    ),
+    null
+  );
 
-  const dilutedShares = toNum(alphaChoose(
-    sq.dilutedSharesOutstanding,
-    sq.sharesOutstanding,
-    sq.commonSharesOutstanding
-  ), null);
+  const dilutedShares = toNum(
+    alphaChoose(
+      sq.dilutedSharesOutstanding,
+      sq.sharesOutstanding,
+      sq.commonSharesOutstanding
+    ),
+    null
+  );
 
-  const epsFromNetIncome = dilutedShares && dilutedShares !== 0 && netIncome !== null ? netIncome / dilutedShares : null;
+  const epsFromNetIncome =
+    dilutedShares && dilutedShares !== 0 && netIncome !== null
+      ? netIncome / dilutedShares
+      : null;
   const epsTtm = epsFromNetIncome ?? quarterlyEpsSum;
-  const fcff = (cfo !== null && capexAbs !== null) ? (cfo - capexAbs) : null;
+  const fcff = cfo !== null && capexAbs !== null ? cfo - capexAbs : null;
 
   return {
     fiscal_period: "TTM",
     fiscal_year: null,
     period_type: "ttm",
-    period_end: alphaChoose(iq[0]?.fiscalDateEnding, cq[0]?.fiscalDateEnding, b0?.fiscalDateEnding, null),
+    period_end: alphaChoose(
+      iq[0]?.fiscalDateEnding,
+      cq[0]?.fiscalDateEnding,
+      b0?.fiscalDateEnding,
+      null
+    ),
     filing_date: null,
     revenue,
     gross_profit: grossProfit,
@@ -491,11 +710,20 @@ function buildAlphaTTM(incomeQuarterly, balanceQuarterly, cashQuarterly, sharesQ
     fcff,
     cash,
     debt,
-    net_cash: (cash !== null && debt !== null) ? (cash - debt) : null,
+    net_cash: cash !== null && debt !== null ? cash - debt : null,
     diluted_shares: dilutedShares,
-    gross_margin: revenue !== null && grossProfit !== null && revenue !== 0 ? grossProfit / revenue : null,
-    ebit_margin: revenue !== null && ebit !== null && revenue !== 0 ? ebit / revenue : null,
-    fcf_margin: revenue !== null && fcff !== null && revenue !== 0 ? fcff / revenue : null,
+    gross_margin:
+      revenue !== null && grossProfit !== null && revenue !== 0
+        ? grossProfit / revenue
+        : null,
+    ebit_margin:
+      revenue !== null && ebit !== null && revenue !== 0
+        ? ebit / revenue
+        : null,
+    fcf_margin:
+      revenue !== null && fcff !== null && revenue !== 0
+        ? fcff / revenue
+        : null,
     roe: null,
     roic: null
   };
@@ -525,8 +753,15 @@ function setCacheEntry(cacheMap, cacheKey, value, ttlMs) {
   cacheMap.set(cacheKey, { expiresAt: Date.now() + ttlMs, value });
 }
 
-function buildActualsCacheKey(symbol, annualYears, quarterlyPeriods, includeTtm) {
-  return `${symbol}__a${annualYears}__q${quarterlyPeriods}__ttm${includeTtm ? 1 : 0}`;
+function buildActualsCacheKey(
+  symbol,
+  annualYears,
+  quarterlyPeriods,
+  includeTtm
+) {
+  return `${symbol}__a${annualYears}__q${quarterlyPeriods}__ttm${
+    includeTtm ? 1 : 0
+  }`;
 }
 
 function secPadCik(cik) {
@@ -564,7 +799,9 @@ async function getSecCompanyFacts(cik) {
   const cached = getCacheEntry(secCompanyFactsCache, cacheKey);
   if (cached) return cached;
 
-  const raw = await secGet(`https://data.sec.gov/api/xbrl/companyfacts/CIK${cik}.json`);
+  const raw = await secGet(
+    `https://data.sec.gov/api/xbrl/companyfacts/CIK${cik}.json`
+  );
   setCacheEntry(secCompanyFactsCache, cacheKey, raw, SEC_CACHE_TTL_MS);
   return raw;
 }
@@ -574,9 +811,9 @@ function secParseDateMs(v) {
   return Number.isFinite(t) ? t : 0;
 }
 
-function secDurationDays(start, end) {
-  const s = secParseDateMs(start);
-  const e = secParseDateMs(end);
+function secDurationDaysFromRow(row) {
+  const s = secParseDateMs(row?.start);
+  const e = secParseDateMs(row?.end);
   if (!s || !e || e < s) return null;
   return Math.round((e - s) / 86400000);
 }
@@ -585,9 +822,10 @@ function secFactRowsByTag(companyFacts, tag, unitsPriority = []) {
   const unitsObj = companyFacts?.facts?.["us-gaap"]?.[tag]?.units || null;
   if (!unitsObj || typeof unitsObj !== "object") return [];
 
-  const selectedUnits = unitsPriority.length > 0
-    ? unitsPriority.filter((u) => Array.isArray(unitsObj[u]))
-    : Object.keys(unitsObj);
+  const selectedUnits =
+    unitsPriority.length > 0
+      ? unitsPriority.filter((u) => Array.isArray(unitsObj[u]))
+      : Object.keys(unitsObj);
 
   const rows = [];
   for (const unit of selectedUnits) {
@@ -602,163 +840,289 @@ function secFactRowsByTag(companyFacts, tag, unitsPriority = []) {
         fp: row?.fp || null,
         form: row?.form || null,
         filed: row?.filed || null,
-        frame: row?.frame || null
+        frame: row?.frame || null,
+        durationDays: secDurationDaysFromRow(row)
       });
     }
   }
 
-  rows.sort((a, b) => secParseDateMs(b.filed) - secParseDateMs(a.filed));
   return rows.filter((r) => r.val !== null && r.end);
 }
 
-function secFindBestDurationValue(companyFacts, tags, periodEnd, periodType) {
-  const annualForms = new Set(["10-K", "10-K/A", "20-F", "20-F/A", "40-F", "40-F/A"]);
-  const quarterlyForms = new Set(["10-Q", "10-Q/A", "6-K", "6-K/A"]);
+function secIsAnnualRow(row) {
+  return (
+    row?.fp === "FY" ||
+    SEC_ANNUAL_FORMS.has(row?.form) ||
+    (row?.durationDays !== null && row.durationDays >= 300)
+  );
+}
 
-  let candidates = [];
-  for (const tag of tags) {
-    candidates = candidates.concat(secFactRowsByTag(companyFacts, tag, ["USD", "USD/shares", "pure"]));
-  }
+function secIsSingleQuarterRow(row) {
+  if (!row || row.durationDays === null) return false;
+  return row.durationDays >= 70 && row.durationDays <= 110;
+}
 
-  candidates = candidates.filter((row) => {
-    if (row.end !== periodEnd) return false;
-    const duration = secDurationDays(row.start, row.end);
-    if (periodType === "annual") {
-      return row.fp === "FY" || annualForms.has(row.form) || (duration !== null && duration >= 300);
-    }
-    return (row.fp && String(row.fp).startsWith("Q")) || quarterlyForms.has(row.form) || (duration !== null && duration >= 60 && duration <= 120);
+function secIsNineMonthRow(row) {
+  if (!row || row.durationDays === null) return false;
+  return row.durationDays >= 240 && row.durationDays <= 300;
+}
+
+function secSortRowsForPreference(rows = []) {
+  return [...rows].sort((a, b) => {
+    const filedDiff = secParseDateMs(b.filed) - secParseDateMs(a.filed);
+    if (filedDiff !== 0) return filedDiff;
+
+    const aQuarterFp = /^Q[1-4]$/.test(String(a.fp || "")) ? 1 : 0;
+    const bQuarterFp = /^Q[1-4]$/.test(String(b.fp || "")) ? 1 : 0;
+    if (bQuarterFp !== aQuarterFp) return bQuarterFp - aQuarterFp;
+
+    const aFrame = a.frame ? 1 : 0;
+    const bFrame = b.frame ? 1 : 0;
+    return bFrame - aFrame;
   });
+}
 
-  if (candidates.length === 0) return null;
-  candidates.sort((a, b) => secParseDateMs(b.filed) - secParseDateMs(a.filed));
-  return candidates[0]?.val ?? null;
+function secGetRowsForTags(
+  companyFacts,
+  tags,
+  unitsPriority = ["USD", "USD/shares", "shares", "pure"]
+) {
+  let rows = [];
+  for (const tag of tags) {
+    rows = rows.concat(secFactRowsByTag(companyFacts, tag, unitsPriority));
+  }
+  return rows;
 }
 
 function secFindBestInstantValue(companyFacts, tags, periodEnd) {
-  let candidates = [];
-  for (const tag of tags) {
-    candidates = candidates.concat(secFactRowsByTag(companyFacts, tag, ["USD", "shares", "USD/shares", "pure"]));
-  }
-
-  candidates = candidates.filter((row) => row.end === periodEnd);
-  if (candidates.length === 0) return null;
-  candidates.sort((a, b) => secParseDateMs(b.filed) - secParseDateMs(a.filed));
+  const candidates = secSortRowsForPreference(
+    secGetRowsForTags(companyFacts, tags, [
+      "USD",
+      "shares",
+      "USD/shares",
+      "pure"
+    ]).filter((row) => row.end === periodEnd)
+  );
   return candidates[0]?.val ?? null;
 }
 
-function secFindDebtValue(companyFacts, periodEnd) {
-  const total = secFindBestInstantValue(companyFacts, [
-    "LongTermDebtAndCapitalLeaseObligations",
-    "LongTermDebtAndCapitalLeaseObligationsIncludingCurrentMaturities",
-    "DebtAndFinanceLeaseObligations",
-    "DebtInstrumentFaceAmount"
-  ], periodEnd);
-
-  if (total !== null) return total;
-
-  const current = secFindBestInstantValue(companyFacts, [
-    "LongTermDebtCurrent",
-    "LongTermDebtAndCapitalLeaseObligationsCurrent",
-    "ShortTermBorrowings"
-  ], periodEnd);
-
-  const noncurrent = secFindBestInstantValue(companyFacts, [
-    "LongTermDebtNoncurrent",
-    "LongTermDebtAndCapitalLeaseObligationsNoncurrent"
-  ], periodEnd);
-
-  if (current !== null && noncurrent !== null) return current + noncurrent;
-  return current ?? noncurrent ?? null;
+function secFindBestAnnualFlowRow(companyFacts, tags, periodEnd) {
+  const candidates = secSortRowsForPreference(
+    secGetRowsForTags(companyFacts, tags, ["USD", "USD/shares", "pure"]).filter(
+      (row) => row.end === periodEnd && secIsAnnualRow(row)
+    )
+  );
+  return candidates[0] || null;
 }
 
-function secCollectPeriodEnds(companyFacts, periodType) {
-  const tags = [
-    "RevenueFromContractWithCustomerExcludingAssessedTax",
-    "SalesRevenueNet",
-    "Revenues",
-    "RevenueFromContractWithCustomerIncludingAssessedTax",
-    "GrossProfit",
-    "OperatingIncomeLoss",
-    "NetIncomeLoss",
-    "NetCashProvidedByUsedInOperatingActivities",
-    "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
-    "PaymentsToAcquirePropertyPlantAndEquipment"
-  ];
+function secFindBestQuarterFlowRow(companyFacts, tags, periodEnd) {
+  const candidates = secSortRowsForPreference(
+    secGetRowsForTags(companyFacts, tags, ["USD", "USD/shares", "pure"]).filter(
+      (row) => row.end === periodEnd && secIsSingleQuarterRow(row)
+    )
+  );
+  return candidates[0] || null;
+}
 
-  const annualForms = new Set(["10-K", "10-K/A", "20-F", "20-F/A", "40-F", "40-F/A"]);
-  const quarterlyForms = new Set(["10-Q", "10-Q/A", "6-K", "6-K/A"]);
-  const seen = new Map();
-
-  for (const tag of tags) {
-    for (const row of secFactRowsByTag(companyFacts, tag, ["USD"])) {
-      const duration = secDurationDays(row.start, row.end);
-      const isAnnual = row.fp === "FY" || annualForms.has(row.form) || (duration !== null && duration >= 300);
-      const isQuarterly = (row.fp && String(row.fp).startsWith("Q")) || quarterlyForms.has(row.form) || (duration !== null && duration >= 60 && duration <= 120);
-
-      if ((periodType === "annual" && !isAnnual) || (periodType === "quarterly" && !isQuarterly)) {
-        continue;
+function secFindBestNineMonthRow(companyFacts, tags, fiscalYear, annualEnd) {
+  const candidates = secSortRowsForPreference(
+    secGetRowsForTags(companyFacts, tags, ["USD", "USD/shares", "pure"]).filter(
+      (row) => {
+        if (!secIsNineMonthRow(row)) return false;
+        if (annualEnd && secParseDateMs(row.end) >= secParseDateMs(annualEnd))
+          return false;
+        if (
+          fiscalYear !== null &&
+          fiscalYear !== undefined &&
+          row.fy !== null &&
+          row.fy !== undefined
+        ) {
+          return Number(row.fy) === Number(fiscalYear);
+        }
+        return true;
       }
+    )
+  );
 
-      const existing = seen.get(row.end);
-      if (!existing || secParseDateMs(row.filed) >= secParseDateMs(existing.filed)) {
-        seen.set(row.end, row);
-      }
-    }
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => {
+    const endDiff = secParseDateMs(b.end) - secParseDateMs(a.end);
+    if (endDiff !== 0) return endDiff;
+    return secParseDateMs(b.filed) - secParseDateMs(a.filed);
+  });
+  return candidates[0];
+}
+
+function secFindQuarterFlowValue(companyFacts, tags, periodEnd) {
+  const directQuarter = secFindBestQuarterFlowRow(companyFacts, tags, periodEnd);
+  if (directQuarter) return directQuarter.val;
+
+  const annualRow = secFindBestAnnualFlowRow(companyFacts, tags, periodEnd);
+  if (!annualRow) return null;
+
+  const nineMonthRow = secFindBestNineMonthRow(
+    companyFacts,
+    tags,
+    annualRow.fy,
+    periodEnd
+  );
+  if (!nineMonthRow) return null;
+
+  return annualRow.val - nineMonthRow.val;
+}
+
+function secHasMeaningfulQuarter(period) {
+  return [
+    period?.revenue,
+    period?.gross_profit,
+    period?.ebit,
+    period?.net_income,
+    period?.cfo,
+    period?.capex,
+    period?.eps_gaap
+  ].some((v) => v !== null && v !== undefined);
+}
+
+function secCollectAnnualEnds(companyFacts) {
+  const rows = secGetRowsForTags(companyFacts, SEC_METRIC_TAGS.revenue, ["USD"]);
+  const ends = new Set();
+  for (const row of rows) {
+    if (secIsAnnualRow(row)) ends.add(row.end);
   }
-
-  return Array.from(seen.keys()).sort().reverse();
+  return Array.from(ends).sort().reverse();
 }
 
-function secBuildUnifiedPeriods(companyFacts, periodType, limit) {
-  const periodEnds = secCollectPeriodEnds(companyFacts, periodType).slice(0, limit);
+function secCollectQuarterCandidateEnds(companyFacts) {
+  const directQuarterRows = secGetRowsForTags(
+    companyFacts,
+    SEC_METRIC_TAGS.revenue,
+    ["USD"]
+  ).filter((row) => secIsSingleQuarterRow(row));
+
+  const annualRows = secGetRowsForTags(
+    companyFacts,
+    SEC_METRIC_TAGS.revenue,
+    ["USD"]
+  ).filter((row) => secIsAnnualRow(row));
+
+  const ends = new Set();
+
+  for (const row of directQuarterRows) ends.add(row.end);
+  for (const row of annualRows) ends.add(row.end);
+
+  return Array.from(ends).sort().reverse();
+}
+
+function secBuildAnnualPeriods(companyFacts, limit) {
+  const periodEnds = secCollectAnnualEnds(companyFacts).slice(0, limit);
 
   return periodEnds.map((periodEnd) => {
-    const revenue = secFindBestDurationValue(companyFacts, [
-      "RevenueFromContractWithCustomerExcludingAssessedTax",
-      "SalesRevenueNet",
-      "Revenues",
-      "RevenueFromContractWithCustomerIncludingAssessedTax"
-    ], periodEnd, periodType);
+    const revenue =
+      secFindBestAnnualFlowRow(
+        companyFacts,
+        SEC_METRIC_TAGS.revenue,
+        periodEnd
+      )?.val ?? null;
+    const grossProfit =
+      secFindBestAnnualFlowRow(
+        companyFacts,
+        SEC_METRIC_TAGS.gross_profit,
+        periodEnd
+      )?.val ?? null;
+    const ebit =
+      secFindBestAnnualFlowRow(
+        companyFacts,
+        SEC_METRIC_TAGS.ebit,
+        periodEnd
+      )?.val ?? null;
+    const netIncome =
+      secFindBestAnnualFlowRow(
+        companyFacts,
+        SEC_METRIC_TAGS.net_income,
+        periodEnd
+      )?.val ?? null;
+    const epsGaap =
+      secFindBestAnnualFlowRow(
+        companyFacts,
+        SEC_METRIC_TAGS.eps_gaap,
+        periodEnd
+      )?.val ?? null;
+    const cfo =
+      secFindBestAnnualFlowRow(
+        companyFacts,
+        SEC_METRIC_TAGS.cfo,
+        periodEnd
+      )?.val ?? null;
 
-    const grossProfit = secFindBestDurationValue(companyFacts, ["GrossProfit"], periodEnd, periodType);
-    const ebit = secFindBestDurationValue(companyFacts, ["OperatingIncomeLoss"], periodEnd, periodType);
-    const netIncome = secFindBestDurationValue(companyFacts, ["NetIncomeLoss", "ProfitLoss"], periodEnd, periodType);
-    const epsGaap = secFindBestDurationValue(companyFacts, [
-      "EarningsPerShareDiluted",
-      "EarningsPerShareBasicAndDiluted"
-    ], periodEnd, periodType);
-
-    const cfo = secFindBestDurationValue(companyFacts, [
-      "NetCashProvidedByUsedInOperatingActivities",
-      "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"
-    ], periodEnd, periodType);
-
-    const capexRaw = secFindBestDurationValue(companyFacts, [
-      "PaymentsToAcquirePropertyPlantAndEquipment",
-      "PropertyPlantAndEquipmentAdditions"
-    ], periodEnd, periodType);
-
+    const capexRaw =
+      secFindBestAnnualFlowRow(
+        companyFacts,
+        SEC_METRIC_TAGS.capex,
+        periodEnd
+      )?.val ?? null;
     const capex = capexRaw === null ? null : Math.abs(capexRaw);
-    const fcff = (cfo !== null && capex !== null) ? (cfo - capex) : null;
+    const fcff = cfo !== null && capex !== null ? cfo - capex : null;
 
-    const cash = secFindBestInstantValue(companyFacts, [
-      "CashAndCashEquivalentsAtCarryingValue",
-      "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
-      "CashCashEquivalentsAndShortTermInvestments"
-    ], periodEnd);
+    const cash = secFindBestInstantValue(
+      companyFacts,
+      SEC_METRIC_TAGS.cash,
+      periodEnd
+    );
+    const debtTotal = secFindBestInstantValue(
+      companyFacts,
+      SEC_METRIC_TAGS.debt_total,
+      periodEnd
+    );
+    const debtCurrent = secFindBestInstantValue(
+      companyFacts,
+      SEC_METRIC_TAGS.debt_current,
+      periodEnd
+    );
+    const debtNoncurrent = secFindBestInstantValue(
+      companyFacts,
+      SEC_METRIC_TAGS.debt_noncurrent,
+      periodEnd
+    );
+    const debt =
+      debtTotal ??
+      (debtCurrent !== null && debtNoncurrent !== null
+        ? debtCurrent + debtNoncurrent
+        : debtCurrent ?? debtNoncurrent ?? null);
 
-    const debt = secFindDebtValue(companyFacts, periodEnd);
-    const dilutedShares = secFindBestInstantValue(companyFacts, ["CommonStockSharesOutstanding"], periodEnd) ??
-      secFindBestDurationValue(companyFacts, ["WeightedAverageNumberOfDilutedSharesOutstanding"], periodEnd, periodType);
+    const dilutedShares =
+      secFindBestInstantValue(
+        companyFacts,
+        SEC_METRIC_TAGS.common_shares_outstanding,
+        periodEnd
+      ) ??
+      (secFindBestAnnualFlowRow(
+        companyFacts,
+        SEC_METRIC_TAGS.diluted_shares_duration,
+        periodEnd
+      )?.val ?? null);
 
-    const fiscalYear = toNum((periodEnd || "").slice(0, 4), null);
+    const annualMeta =
+      secFindBestAnnualFlowRow(
+        companyFacts,
+        SEC_METRIC_TAGS.revenue,
+        periodEnd
+      ) ||
+      secFindBestAnnualFlowRow(
+        companyFacts,
+        SEC_METRIC_TAGS.net_income,
+        periodEnd
+      );
+    const fiscalYear = toNum(
+      annualMeta?.fy ?? (periodEnd || "").slice(0, 4),
+      null
+    );
 
     return {
-      fiscal_period: periodType === "annual" ? `FY${fiscalYear ?? ""}` : periodEnd,
+      fiscal_period: `FY${fiscalYear ?? ""}`,
       fiscal_year: fiscalYear,
-      period_type: periodType,
+      period_type: "annual",
       period_end: periodEnd,
-      filing_date: null,
+      filing_date: annualMeta?.filed || null,
       revenue,
       gross_profit: grossProfit,
       ebit,
@@ -771,23 +1135,187 @@ function secBuildUnifiedPeriods(companyFacts, periodType, limit) {
       fcff,
       cash,
       debt,
-      net_cash: (cash !== null && debt !== null) ? (cash - debt) : null,
+      net_cash: cash !== null && debt !== null ? cash - debt : null,
       diluted_shares: dilutedShares,
-      gross_margin: revenue !== null && grossProfit !== null && revenue !== 0 ? grossProfit / revenue : null,
-      ebit_margin: revenue !== null && ebit !== null && revenue !== 0 ? ebit / revenue : null,
-      fcf_margin: revenue !== null && fcff !== null && revenue !== 0 ? fcff / revenue : null,
+      gross_margin:
+        revenue !== null && grossProfit !== null && revenue !== 0
+          ? grossProfit / revenue
+          : null,
+      ebit_margin:
+        revenue !== null && ebit !== null && revenue !== 0
+          ? ebit / revenue
+          : null,
+      fcf_margin:
+        revenue !== null && fcff !== null && revenue !== 0
+          ? fcff / revenue
+          : null,
       roe: null,
       roic: null
     };
   });
 }
 
-function secBuildTTM(companyFacts, quarterlies) {
+function secBuildQuarterlyPeriods(companyFacts, limit) {
+  const periodEnds = secCollectQuarterCandidateEnds(companyFacts);
+  const out = [];
+
+  for (const periodEnd of periodEnds) {
+    const revenue = secFindQuarterFlowValue(
+      companyFacts,
+      SEC_METRIC_TAGS.revenue,
+      periodEnd
+    );
+    const grossProfit = secFindQuarterFlowValue(
+      companyFacts,
+      SEC_METRIC_TAGS.gross_profit,
+      periodEnd
+    );
+    const ebit = secFindQuarterFlowValue(
+      companyFacts,
+      SEC_METRIC_TAGS.ebit,
+      periodEnd
+    );
+    const netIncome = secFindQuarterFlowValue(
+      companyFacts,
+      SEC_METRIC_TAGS.net_income,
+      periodEnd
+    );
+    const epsGaap = secFindQuarterFlowValue(
+      companyFacts,
+      SEC_METRIC_TAGS.eps_gaap,
+      periodEnd
+    );
+    const cfo = secFindQuarterFlowValue(
+      companyFacts,
+      SEC_METRIC_TAGS.cfo,
+      periodEnd
+    );
+
+    const capexRaw = secFindQuarterFlowValue(
+      companyFacts,
+      SEC_METRIC_TAGS.capex,
+      periodEnd
+    );
+    const capex = capexRaw === null ? null : Math.abs(capexRaw);
+    const fcff = cfo !== null && capex !== null ? cfo - capex : null;
+
+    const cash = secFindBestInstantValue(
+      companyFacts,
+      SEC_METRIC_TAGS.cash,
+      periodEnd
+    );
+    const debtTotal = secFindBestInstantValue(
+      companyFacts,
+      SEC_METRIC_TAGS.debt_total,
+      periodEnd
+    );
+    const debtCurrent = secFindBestInstantValue(
+      companyFacts,
+      SEC_METRIC_TAGS.debt_current,
+      periodEnd
+    );
+    const debtNoncurrent = secFindBestInstantValue(
+      companyFacts,
+      SEC_METRIC_TAGS.debt_noncurrent,
+      periodEnd
+    );
+    const debt =
+      debtTotal ??
+      (debtCurrent !== null && debtNoncurrent !== null
+        ? debtCurrent + debtNoncurrent
+        : debtCurrent ?? debtNoncurrent ?? null);
+
+    const dilutedShares =
+      secFindBestInstantValue(
+        companyFacts,
+        SEC_METRIC_TAGS.common_shares_outstanding,
+        periodEnd
+      ) ??
+      (secFindBestQuarterFlowRow(
+        companyFacts,
+        SEC_METRIC_TAGS.diluted_shares_duration,
+        periodEnd
+      )?.val ?? null);
+
+    const quarterMeta =
+      secFindBestQuarterFlowRow(
+        companyFacts,
+        SEC_METRIC_TAGS.revenue,
+        periodEnd
+      ) ||
+      secFindBestAnnualFlowRow(
+        companyFacts,
+        SEC_METRIC_TAGS.revenue,
+        periodEnd
+      ) ||
+      secFindBestQuarterFlowRow(
+        companyFacts,
+        SEC_METRIC_TAGS.net_income,
+        periodEnd
+      ) ||
+      secFindBestAnnualFlowRow(
+        companyFacts,
+        SEC_METRIC_TAGS.net_income,
+        periodEnd
+      );
+
+    const period = {
+      fiscal_period: periodEnd,
+      fiscal_year: toNum(
+        quarterMeta?.fy ?? (periodEnd || "").slice(0, 4),
+        null
+      ),
+      period_type: "quarterly",
+      period_end: periodEnd,
+      filing_date: quarterMeta?.filed || null,
+      revenue,
+      gross_profit: grossProfit,
+      ebit,
+      ebitda: null,
+      net_income: netIncome,
+      eps_gaap: epsGaap,
+      eps_nongaap: epsGaap,
+      cfo,
+      capex,
+      fcff,
+      cash,
+      debt,
+      net_cash: cash !== null && debt !== null ? cash - debt : null,
+      diluted_shares: dilutedShares,
+      gross_margin:
+        revenue !== null && grossProfit !== null && revenue !== 0
+          ? grossProfit / revenue
+          : null,
+      ebit_margin:
+        revenue !== null && ebit !== null && revenue !== 0
+          ? ebit / revenue
+          : null,
+      fcf_margin:
+        revenue !== null && fcff !== null && revenue !== 0
+          ? fcff / revenue
+          : null,
+      roe: null,
+      roic: null
+    };
+
+    if (secHasMeaningfulQuarter(period)) {
+      out.push(period);
+    }
+
+    if (out.length >= limit) break;
+  }
+
+  return out;
+}
+
+function secBuildTTMFromQuarterlies(quarterlies) {
   const q = [...quarterlies].slice(0, 4);
   if (q.length === 0) return buildEmptyTtm();
 
   const sumField = (field) => {
-    const vals = q.map((row) => toNum(row?.[field], null)).filter((v) => v !== null);
+    const vals = q
+      .map((row) => toNum(row?.[field], null))
+      .filter((v) => v !== null);
     return vals.length > 0 ? vals.reduce((a, b) => a + b, 0) : null;
   };
 
@@ -797,27 +1325,23 @@ function secBuildTTM(companyFacts, quarterlies) {
   const netIncome = sumField("net_income");
   const cfo = sumField("cfo");
   const capex = sumField("capex");
-  const fcff = (cfo !== null && capex !== null) ? (cfo - capex) : null;
+  const fcff = cfo !== null && capex !== null ? cfo - capex : null;
   const epsQuarterlySum = sumField("eps_gaap");
 
-  const latestPeriodEnd = q[0]?.period_end || null;
-  const cash = latestPeriodEnd ? secFindBestInstantValue(companyFacts, [
-    "CashAndCashEquivalentsAtCarryingValue",
-    "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
-    "CashCashEquivalentsAndShortTermInvestments"
-  ], latestPeriodEnd) : null;
-
-  const debt = latestPeriodEnd ? secFindDebtValue(companyFacts, latestPeriodEnd) : null;
-  const dilutedShares = latestPeriodEnd ? secFindBestInstantValue(companyFacts, ["CommonStockSharesOutstanding"], latestPeriodEnd) : null;
-  const epsFromNetIncome = dilutedShares && dilutedShares !== 0 && netIncome !== null ? netIncome / dilutedShares : null;
+  const latest = q[0] || {};
+  const dilutedShares = latest?.diluted_shares ?? null;
+  const epsFromNetIncome =
+    dilutedShares && dilutedShares !== 0 && netIncome !== null
+      ? netIncome / dilutedShares
+      : null;
   const epsTtm = epsFromNetIncome ?? epsQuarterlySum;
 
   return {
     fiscal_period: "TTM",
     fiscal_year: null,
     period_type: "ttm",
-    period_end: latestPeriodEnd,
-    filing_date: null,
+    period_end: latest?.period_end || null,
+    filing_date: latest?.filing_date || null,
     revenue,
     gross_profit: grossProfit,
     ebit,
@@ -828,23 +1352,39 @@ function secBuildTTM(companyFacts, quarterlies) {
     cfo,
     capex,
     fcff,
-    cash,
-    debt,
-    net_cash: (cash !== null && debt !== null) ? (cash - debt) : null,
+    cash: latest?.cash ?? null,
+    debt: latest?.debt ?? null,
+    net_cash:
+      latest?.cash !== null &&
+      latest?.cash !== undefined &&
+      latest?.debt !== null &&
+      latest?.debt !== undefined
+        ? latest.cash - latest.debt
+        : null,
     diluted_shares: dilutedShares,
-    gross_margin: revenue !== null && grossProfit !== null && revenue !== 0 ? grossProfit / revenue : null,
-    ebit_margin: revenue !== null && ebit !== null && revenue !== 0 ? ebit / revenue : null,
-    fcf_margin: revenue !== null && fcff !== null && revenue !== 0 ? fcff / revenue : null,
+    gross_margin:
+      revenue !== null && grossProfit !== null && revenue !== 0
+        ? grossProfit / revenue
+        : null,
+    ebit_margin:
+      revenue !== null && ebit !== null && revenue !== 0
+        ? ebit / revenue
+        : null,
+    fcf_margin:
+      revenue !== null && fcff !== null && revenue !== 0
+        ? fcff / revenue
+        : null,
     roe: null,
     roic: null
   };
 }
 
-function periodsNeedShares(rows = []) {
-  return rows.some((row) => row?.diluted_shares === null || row?.diluted_shares === undefined);
-}
-
-async function fetchAlphaFundamentalActuals(symbol, annualYears, quarterlyPeriods, includeTtm) {
+async function fetchAlphaFundamentalActuals(
+  symbol,
+  annualYears,
+  quarterlyPeriods,
+  includeTtm
+) {
   const sourceStatus = [];
   const warnings = [];
 
@@ -865,7 +1405,9 @@ async function fetchAlphaFundamentalActuals(symbol, annualYears, quarterlyPeriod
       sourceStatus.push(alphaProblemToSourceStatus("alpha_vantage_core", problem));
     }
     const primary = coreProblems[0];
-    const err = new Error("Alpha Vantage returned a note/error payload instead of usable core fundamental statements.");
+    const err = new Error(
+      "Alpha Vantage returned a note/error payload instead of usable core fundamental statements."
+    );
     err.isKnownUpstream = true;
     err.httpStatus = primary.httpStatus;
     err.code = primary.code;
@@ -896,49 +1438,116 @@ async function fetchAlphaFundamentalActuals(symbol, annualYears, quarterlyPeriod
   );
 
   let ttm = includeTtm
-    ? buildAlphaTTM(income.quarterly.slice(0, 4), balance.quarterly.slice(0, 1), cash.quarterly.slice(0, 4), [])
+    ? buildAlphaTTM(
+        income.quarterly.slice(0, 4),
+        balance.quarterly.slice(0, 1),
+        cash.quarterly.slice(0, 4),
+        []
+      )
     : buildEmptyTtm();
 
   if (annuals.length === 0 && quarterlies.length === 0) {
-    const err = new Error("Alpha Vantage returned empty statement arrays for the requested symbol.");
+    const err = new Error(
+      "Alpha Vantage returned empty statement arrays for the requested symbol."
+    );
     err.isKnownUpstream = true;
     err.httpStatus = 502;
     err.code = "ALPHAVANTAGE_EMPTY_STATEMENTS";
     err.retryable = true;
-    err.sourceStatus = [{ provider: "alpha_vantage_core", status: "partial", note: "alpha income/balance/cashflow payload was valid but contained no statement rows" }];
+    err.sourceStatus = [
+      {
+        provider: "alpha_vantage_core",
+        status: "partial",
+        note: "alpha income/balance/cashflow payload was valid but contained no statement rows"
+      }
+    ];
     err.warnings = warnings;
     throw err;
   }
 
-  sourceStatus.push({ provider: "alpha_vantage_core", status: "ok", note: "alpha income/balance/cashflow loaded" });
+  sourceStatus.push({
+    provider: "alpha_vantage_core",
+    status: "ok",
+    note: "alpha income/balance/cashflow loaded"
+  });
 
-  if (periodsNeedShares(annuals) || periodsNeedShares(quarterlies) || (includeTtm && (ttm.diluted_shares === null || ttm.diluted_shares === undefined))) {
+  const needShares =
+    annuals.some((row) => row?.diluted_shares == null) ||
+    quarterlies.some((row) => row?.diluted_shares == null) ||
+    (includeTtm && ttm?.diluted_shares == null);
+
+  if (needShares) {
     try {
-      const sharesRaw = await alphaGet({ function: "SHARES_OUTSTANDING", symbol });
+      const sharesRaw = await alphaGet({
+        function: "SHARES_OUTSTANDING",
+        symbol
+      });
       const sharesProblem = alphaExtractProblem(sharesRaw);
 
       if (sharesProblem) {
-        sourceStatus.push(alphaProblemToSourceStatus("alpha_vantage_shares", sharesProblem));
-        warnings.push("Alpha shares endpoint returned note/error payload; continuing without diluted_shares enrichment where unavailable.");
+        sourceStatus.push(
+          alphaProblemToSourceStatus("alpha_vantage_shares", sharesProblem)
+        );
+        warnings.push(
+          "Alpha shares endpoint returned note/error payload; continuing without diluted_shares enrichment where unavailable."
+        );
       } else {
         const shares = normalizeAlphaShares(sharesRaw);
-        annuals = buildAlphaUnifiedPeriods(income.annual.slice(0, annualYears), balance.annual.slice(0, annualYears), cash.annual.slice(0, annualYears), shares.annual.slice(0, annualYears), "annual");
-        quarterlies = buildAlphaUnifiedPeriods(income.quarterly.slice(0, quarterlyPeriods), balance.quarterly.slice(0, quarterlyPeriods), cash.quarterly.slice(0, quarterlyPeriods), shares.quarterly.slice(0, quarterlyPeriods), "quarterly");
-        ttm = includeTtm ? buildAlphaTTM(income.quarterly.slice(0, 4), balance.quarterly.slice(0, 1), cash.quarterly.slice(0, 4), shares.quarterly.slice(0, 1)) : buildEmptyTtm();
-        sourceStatus.push({ provider: "alpha_vantage_shares", status: "ok", note: "alpha shares outstanding loaded" });
+        annuals = buildAlphaUnifiedPeriods(
+          income.annual.slice(0, annualYears),
+          balance.annual.slice(0, annualYears),
+          cash.annual.slice(0, annualYears),
+          shares.annual.slice(0, annualYears),
+          "annual"
+        );
+        quarterlies = buildAlphaUnifiedPeriods(
+          income.quarterly.slice(0, quarterlyPeriods),
+          balance.quarterly.slice(0, quarterlyPeriods),
+          cash.quarterly.slice(0, quarterlyPeriods),
+          shares.quarterly.slice(0, quarterlyPeriods),
+          "quarterly"
+        );
+        ttm = includeTtm
+          ? buildAlphaTTM(
+              income.quarterly.slice(0, 4),
+              balance.quarterly.slice(0, 1),
+              cash.quarterly.slice(0, 4),
+              shares.quarterly.slice(0, 1)
+            )
+          : buildEmptyTtm();
+        sourceStatus.push({
+          provider: "alpha_vantage_shares",
+          status: "ok",
+          note: "alpha shares outstanding loaded"
+        });
       }
     } catch (e) {
-      sourceStatus.push({ provider: "alpha_vantage_shares", status: "partial", note: `alpha shares outstanding unavailable: ${e.message}` });
-      warnings.push("Alpha shares endpoint failed; continuing without diluted_shares enrichment where unavailable.");
+      sourceStatus.push({
+        provider: "alpha_vantage_shares",
+        status: "partial",
+        note: `alpha shares outstanding unavailable: ${e.message}`
+      });
+      warnings.push(
+        "Alpha shares endpoint failed; continuing without diluted_shares enrichment where unavailable."
+      );
     }
   } else {
-    sourceStatus.push({ provider: "alpha_vantage_shares", status: "ok", note: "shares endpoint skipped because core statement payload was already sufficient" });
+    sourceStatus.push({
+      provider: "alpha_vantage_shares",
+      status: "ok",
+      note: "shares endpoint skipped because core statement payload was already sufficient"
+    });
   }
 
   return { data: { annuals, quarterlies, ttm }, sourceStatus, warnings };
 }
 
-async function fetchSecFundamentalActuals(symbol, annualYears, quarterlyPeriods, includeTtm) {
+async function fetchSecFundamentalActuals(
+  symbol,
+  annualYears,
+  quarterlyPeriods,
+  includeTtm
+) {
   const sourceStatus = [];
   const warnings = [];
 
@@ -949,42 +1558,78 @@ async function fetchSecFundamentalActuals(symbol, annualYears, quarterlyPeriods,
     err.httpStatus = 404;
     err.code = "SEC_TICKER_NOT_FOUND";
     err.retryable = false;
-    err.sourceStatus = [{ provider: "sec_tickers", status: "partial", note: `SEC ticker mapping not found for ${symbol}` }];
+    err.sourceStatus = [
+      {
+        provider: "sec_tickers",
+        status: "partial",
+        note: `SEC ticker mapping not found for ${symbol}`
+      }
+    ];
     err.warnings = warnings;
     throw err;
   }
 
-  sourceStatus.push({ provider: "sec_tickers", status: "ok", note: `resolved ${symbol} to CIK ${tickerInfo.cik}` });
+  sourceStatus.push({
+    provider: "sec_tickers",
+    status: "ok",
+    note: `resolved ${symbol} to CIK ${tickerInfo.cik}`
+  });
 
   let companyFacts;
   try {
     companyFacts = await getSecCompanyFacts(tickerInfo.cik);
-    sourceStatus.push({ provider: "sec_companyfacts", status: "ok", note: "SEC companyfacts loaded" });
+    sourceStatus.push({
+      provider: "sec_companyfacts",
+      status: "ok",
+      note: "SEC companyfacts loaded"
+    });
   } catch (e) {
     const err = new Error("SEC companyfacts unavailable for the requested symbol.");
     err.isKnownUpstream = true;
     err.httpStatus = 502;
     err.code = "SEC_COMPANYFACTS_UNAVAILABLE";
     err.retryable = true;
-    err.sourceStatus = [...sourceStatus, { provider: "sec_companyfacts", status: "partial", note: `SEC companyfacts unavailable: ${e.message}` }];
+    err.sourceStatus = [
+      ...sourceStatus,
+      {
+        provider: "sec_companyfacts",
+        status: "partial",
+        note: `SEC companyfacts unavailable: ${e.message}`
+      }
+    ];
     err.warnings = warnings;
     throw err;
   }
 
-  const annuals = secBuildUnifiedPeriods(companyFacts, "annual", annualYears);
-  const quarterlies = secBuildUnifiedPeriods(companyFacts, "quarterly", quarterlyPeriods);
-  const ttm = includeTtm ? secBuildTTM(companyFacts, quarterlies) : buildEmptyTtm();
+  const annuals = secBuildAnnualPeriods(companyFacts, annualYears);
+  const quarterlies = secBuildQuarterlyPeriods(companyFacts, quarterlyPeriods);
+  const ttm = includeTtm
+    ? secBuildTTMFromQuarterlies(quarterlies)
+    : buildEmptyTtm();
 
   if (annuals.length === 0 && quarterlies.length === 0) {
-    const err = new Error("SEC companyfacts did not yield usable annual or quarterly periods.");
+    const err = new Error(
+      "SEC companyfacts did not yield usable annual or quarterly periods."
+    );
     err.isKnownUpstream = true;
     err.httpStatus = 502;
     err.code = "SEC_EMPTY_FACTS";
     err.retryable = true;
-    err.sourceStatus = [...sourceStatus, { provider: "sec_companyfacts", status: "partial", note: "SEC companyfacts loaded but no usable annual/quarterly periods were extracted" }];
+    err.sourceStatus = [
+      ...sourceStatus,
+      {
+        provider: "sec_companyfacts",
+        status: "partial",
+        note: "SEC companyfacts loaded but no usable annual/quarterly periods were extracted"
+      }
+    ];
     err.warnings = warnings;
     throw err;
   }
+
+  warnings.push(
+    "SEC quarterly normalization uses pure single-quarter extraction and derives Q4 from FY minus 9M when needed."
+  );
 
   return { data: { annuals, quarterlies, ttm }, sourceStatus, warnings };
 }
@@ -992,32 +1637,49 @@ async function fetchSecFundamentalActuals(symbol, annualYears, quarterlyPeriods,
 function buildUnsupportedActualsPayload(instrumentType) {
   return {
     data: { annuals: [], quarterlies: [], ttm: buildEmptyTtm() },
-    sourceStatus: [{ provider: "local-router", status: "ok", note: `fundamental actuals not applicable for instrument_type=${instrumentType}` }],
-    warnings: [`fundamental_actuals_pack is not applicable to instrument_type=${instrumentType}; use framework-specific data instead.`]
+    sourceStatus: [
+      {
+        provider: "local-router",
+        status: "ok",
+        note: `fundamental actuals not applicable for instrument_type=${instrumentType}`
+      }
+    ],
+    warnings: [
+      `fundamental_actuals_pack is not applicable to instrument_type=${instrumentType}; use framework-specific data instead.`
+    ]
   };
 }
 
 app.post("/v1/classify-instrument", (req, res) => {
   const symbol = (req.body.symbol || "").toUpperCase().trim();
   if (!symbol) {
-    return res.status(400).json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
+    return res
+      .status(400)
+      .json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
   }
 
   const { instrument_type, framework_id } = classifyLocal(symbol);
-  return res.json(success({
-    symbol,
-    canonical_symbol: symbol,
-    instrument_type,
-    framework_id,
-    confidence_score: 0.98,
-    needs_user_confirmation: false
-  }, [{ provider: "local-router", status: "ok", note: "local classification used" }]));
+  return res.json(
+    success(
+      {
+        symbol,
+        canonical_symbol: symbol,
+        instrument_type,
+        framework_id,
+        confidence_score: 0.98,
+        needs_user_confirmation: false
+      },
+      [{ provider: "local-router", status: "ok", note: "local classification used" }]
+    )
+  );
 });
 
 app.post("/v1/security-master", async (req, res) => {
   const symbol = (req.body.symbol || "").toUpperCase().trim();
   if (!symbol) {
-    return res.status(400).json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
+    return res
+      .status(400)
+      .json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
   }
 
   const sourceStatus = [];
@@ -1027,48 +1689,86 @@ app.post("/v1/security-master", async (req, res) => {
   try {
     const fmpData = await fmpStableGet("profile", { symbol });
     fmpProfile = normalizeFmpProfile(fmpData);
-    sourceStatus.push({ provider: "fmp", status: fmpProfile ? "ok" : "partial", note: fmpProfile ? "fmp stable profile loaded" : "fmp stable profile empty" });
+    sourceStatus.push({
+      provider: "fmp",
+      status: fmpProfile ? "ok" : "partial",
+      note: fmpProfile ? "fmp stable profile loaded" : "fmp stable profile empty"
+    });
   } catch (e) {
-    sourceStatus.push({ provider: "fmp", status: "partial", note: `fmp stable profile unavailable: ${e.message}` });
+    sourceStatus.push({
+      provider: "fmp",
+      status: "partial",
+      note: `fmp stable profile unavailable: ${e.message}`
+    });
   }
 
   try {
     const profile = await finnhubGet("/stock/profile2", { symbol });
     if (!profile || !profile.name) throw new Error("finnhub profile empty");
 
-    sourceStatus.unshift({ provider: "finnhub", status: "ok", note: "primary profile loaded" });
-    return res.json(success(mapFinnhubProfileToSecurityMaster(symbol, profile, fmpProfile), sourceStatus, warnings));
+    sourceStatus.unshift({
+      provider: "finnhub",
+      status: "ok",
+      note: "primary profile loaded"
+    });
+    return res.json(
+      success(mapFinnhubProfileToSecurityMaster(symbol, profile, fmpProfile), sourceStatus, warnings)
+    );
   } catch (e) {
-    sourceStatus.unshift({ provider: "finnhub", status: "partial", note: `primary profile unavailable: ${e.message}` });
+    sourceStatus.unshift({
+      provider: "finnhub",
+      status: "partial",
+      note: `primary profile unavailable: ${e.message}`
+    });
   }
 
   if (fmpProfile) {
     const { framework_id } = classifyLocal(symbol);
-    return res.json(success({
-      symbol,
-      security_name: fmpProfile.companyName || symbol,
-      exchange: fmpProfile.exchange || "",
-      country: fmpProfile.country || "",
-      sector: fmpProfile.sector || "",
-      industry: fmpProfile.industry || "",
-      trading_currency: fmpProfile.currency || "USD",
-      reporting_currency: fmpProfile.currency || "USD",
-      fiscal_year_end: knownFiscalYearEnd[symbol] || "12-31",
-      is_adr: framework_id === "adr_equity_core",
-      adr_ratio: symbol === "BABA" ? 8.0 : null,
-      framework_id
-    }, sourceStatus, ["Primary source unavailable, using FMP stable fallback for security master."]));
+    return res.json(
+      success(
+        {
+          symbol,
+          security_name: fmpProfile.companyName || symbol,
+          exchange: fmpProfile.exchange || "",
+          country: fmpProfile.country || "",
+          sector: fmpProfile.sector || "",
+          industry: fmpProfile.industry || "",
+          trading_currency: fmpProfile.currency || "USD",
+          reporting_currency: fmpProfile.currency || "USD",
+          fiscal_year_end: knownFiscalYearEnd[symbol] || "12-31",
+          is_adr: framework_id === "adr_equity_core",
+          adr_ratio: symbol === "BABA" ? 8.0 : null,
+          framework_id
+        },
+        sourceStatus,
+        ["Primary source unavailable, using FMP stable fallback for security master."]
+      )
+    );
   }
 
-  return res.status(502).json(fail("ALL_PROVIDERS_UNAVAILABLE", "Unable to load security master from Finnhub/FMP.", 502, sourceStatus));
+  return res
+    .status(502)
+    .json(
+      fail(
+        "ALL_PROVIDERS_UNAVAILABLE",
+        "Unable to load security master from Finnhub/FMP.",
+        502,
+        sourceStatus
+      )
+    );
 });
 
 app.post("/v1/market-price-pack", async (req, res) => {
   const symbol = (req.body.symbol || "").toUpperCase().trim();
-  const historyYears = Math.max(1, Math.min(10, Number(req.body.history_years || 1)));
+  const historyYears = Math.max(
+    1,
+    Math.min(10, Number(req.body.history_years || 1))
+  );
 
   if (!symbol) {
-    return res.status(400).json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
+    return res
+      .status(400)
+      .json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
   }
 
   const sourceStatus = [];
@@ -1088,24 +1788,48 @@ app.post("/v1/market-price-pack", async (req, res) => {
       finnhubGet("/stock/profile2", { symbol })
     ]);
 
-    if (toNum(quote?.c, null) === null) throw new Error("finnhub quote missing c");
+    if (toNum(quote?.c, null) === null) {
+      throw new Error("finnhub quote missing c");
+    }
 
     finnhubQuote = quote;
-    sourceStatus.push({ provider: "finnhub", status: "ok", note: "finnhub quote/profile loaded" });
+    sourceStatus.push({
+      provider: "finnhub",
+      status: "ok",
+      note: "finnhub quote/profile loaded"
+    });
   } catch (e) {
-    sourceStatus.push({ provider: "finnhub", status: "partial", note: `finnhub quote/profile unavailable: ${e.message}` });
+    sourceStatus.push({
+      provider: "finnhub",
+      status: "partial",
+      note: `finnhub quote/profile unavailable: ${e.message}`
+    });
   }
 
   try {
-    const candles = await finnhubGet("/stock/candle", { symbol, resolution: "D", from: fromSec, to: nowSec });
+    const candles = await finnhubGet("/stock/candle", {
+      symbol,
+      resolution: "D",
+      from: fromSec,
+      to: nowSec
+    });
+
     finnhubOHLCV = buildFinnhubOHLCV(candles);
+
     sourceStatus.push({
       provider: "finnhub_candles",
       status: finnhubOHLCV.length > 0 ? "ok" : "partial",
-      note: finnhubOHLCV.length > 0 ? "finnhub candles loaded" : `finnhub candles unavailable: status=${String(candles?.s)}`
+      note:
+        finnhubOHLCV.length > 0
+          ? "finnhub candles loaded"
+          : `finnhub candles unavailable: status=${String(candles?.s)}`
     });
   } catch (e) {
-    sourceStatus.push({ provider: "finnhub_candles", status: "partial", note: `finnhub candles unavailable: ${e.message}` });
+    sourceStatus.push({
+      provider: "finnhub_candles",
+      status: "partial",
+      note: `finnhub candles unavailable: ${e.message}`
+    });
   }
 
   try {
@@ -1115,12 +1839,28 @@ app.post("/v1/market-price-pack", async (req, res) => {
     ]);
 
     fmpProfile = normalizeFmpProfile(profileData);
-    fmpOHLCV = buildFmpOHLCV(historicalData, Math.min(252 * historyYears, 2520));
+    fmpOHLCV = buildFmpOHLCV(
+      historicalData,
+      Math.min(252 * historyYears, 2520)
+    );
 
-    sourceStatus.push({ provider: "fmp", status: fmpProfile ? "ok" : "partial", note: fmpProfile ? "fmp stable profile loaded" : "fmp stable profile empty" });
-    sourceStatus.push({ provider: "fmp_history", status: fmpOHLCV.length > 0 ? "ok" : "partial", note: fmpOHLCV.length > 0 ? "fmp historical eod loaded" : "fmp historical eod empty" });
+    sourceStatus.push({
+      provider: "fmp",
+      status: fmpProfile ? "ok" : "partial",
+      note: fmpProfile ? "fmp stable profile loaded" : "fmp stable profile empty"
+    });
+
+    sourceStatus.push({
+      provider: "fmp_history",
+      status: fmpOHLCV.length > 0 ? "ok" : "partial",
+      note: fmpOHLCV.length > 0 ? "fmp historical eod loaded" : "fmp historical eod empty"
+    });
   } catch (e) {
-    sourceStatus.push({ provider: "fmp", status: "partial", note: `fmp stable fallback unavailable: ${e.message}` });
+    sourceStatus.push({
+      provider: "fmp",
+      status: "partial",
+      note: `fmp stable fallback unavailable: ${e.message}`
+    });
   }
 
   try {
@@ -1135,16 +1875,35 @@ app.post("/v1/market-price-pack", async (req, res) => {
       limit: Math.min(1000, 260 * historyYears)
     });
 
-    marketstackOHLCV = buildMarketstackOHLCV(msData, Math.min(252 * historyYears, 2520));
-    sourceStatus.push({ provider: "marketstack", status: marketstackOHLCV.length > 0 ? "ok" : "partial", note: marketstackOHLCV.length > 0 ? "marketstack eod history loaded" : "marketstack eod history empty" });
+    marketstackOHLCV = buildMarketstackOHLCV(
+      msData,
+      Math.min(252 * historyYears, 2520)
+    );
+
+    sourceStatus.push({
+      provider: "marketstack",
+      status: marketstackOHLCV.length > 0 ? "ok" : "partial",
+      note:
+        marketstackOHLCV.length > 0
+          ? "marketstack eod history loaded"
+          : "marketstack eod history empty"
+    });
   } catch (e) {
-    sourceStatus.push({ provider: "marketstack", status: "partial", note: `marketstack fallback unavailable: ${e.message}` });
+    sourceStatus.push({
+      provider: "marketstack",
+      status: "partial",
+      note: `marketstack fallback unavailable: ${e.message}`
+    });
   }
 
   let priceCurrent = toNum(finnhubQuote?.c, null);
   if (priceCurrent === null && fmpProfile) {
     priceCurrent = toNum(fmpProfile.price, null);
-    if (priceCurrent !== null) warnings.push("Using FMP profile price fallback because Finnhub quote was unavailable.");
+    if (priceCurrent !== null) {
+      warnings.push(
+        "Using FMP profile price fallback because Finnhub quote was unavailable."
+      );
+    }
   }
 
   let ohlcv = [];
@@ -1157,73 +1916,131 @@ app.post("/v1/market-price-pack", async (req, res) => {
 
   if (ohlcv.length === 0 && ALPHAVANTAGE_API_KEY) {
     try {
-      const dailyRaw = await alphaGet({ function: "TIME_SERIES_DAILY_ADJUSTED", symbol, outputsize: "compact" });
+      const dailyRaw = await alphaGet({
+        function: "TIME_SERIES_DAILY_ADJUSTED",
+        symbol,
+        outputsize: "compact"
+      });
+
       const problem = alphaExtractProblem(dailyRaw);
 
       if (problem) {
         sourceStatus.push(alphaProblemToSourceStatus("alpha_vantage", problem));
       } else {
-        const alphaOHLCV = buildAlphaOHLCV(dailyRaw?.["Time Series (Daily)"] || dailyRaw?.["Time Series (Daily Adjusted)"], 120);
+        const alphaOHLCV = buildAlphaOHLCV(
+          dailyRaw?.["Time Series (Daily)"] ||
+            dailyRaw?.["Time Series (Daily Adjusted)"],
+          120
+        );
         if (alphaOHLCV.length > 0) {
           ohlcv = alphaOHLCV;
-          sourceStatus.push({ provider: "alpha_vantage", status: "ok", note: "alpha daily fallback loaded" });
+          sourceStatus.push({
+            provider: "alpha_vantage",
+            status: "ok",
+            note: "alpha daily fallback loaded"
+          });
           warnings.push("Using Alpha Vantage fallback for OHLCV.");
         } else {
-          sourceStatus.push({ provider: "alpha_vantage", status: "partial", note: "alpha daily payload empty" });
+          sourceStatus.push({
+            provider: "alpha_vantage",
+            status: "partial",
+            note: "alpha daily payload empty"
+          });
         }
       }
     } catch (e) {
-      sourceStatus.push({ provider: "alpha_vantage", status: "partial", note: `alpha fallback unavailable: ${e.message}` });
+      sourceStatus.push({
+        provider: "alpha_vantage",
+        status: "partial",
+        note: `alpha fallback unavailable: ${e.message}`
+      });
     }
   }
 
   if (priceCurrent === null || ohlcv.length === 0) {
-    return res.status(502).json(fail("ALL_PROVIDERS_UNAVAILABLE", "Unable to assemble a usable market price pack from Finnhub/FMP/Marketstack/Alpha.", 502, sourceStatus, warnings));
+    return res
+      .status(502)
+      .json(
+        fail(
+          "ALL_PROVIDERS_UNAVAILABLE",
+          "Unable to assemble a usable market price pack from Finnhub/FMP/Marketstack/Alpha.",
+          502,
+          sourceStatus,
+          warnings
+        )
+      );
   }
 
   const marketCap =
     toNum(fmpProfile?.marketCap, null) ??
-    (toNum(fmpProfile?.sharesOutstanding, null) !== null ? toNum(fmpProfile.sharesOutstanding, null) * priceCurrent : null);
+    (toNum(fmpProfile?.sharesOutstanding, null) !== null
+      ? toNum(fmpProfile.sharesOutstanding, null) * priceCurrent
+      : null);
 
   const sharesOutstanding =
     toNum(fmpProfile?.sharesOutstanding, null) ??
     (marketCap !== null && priceCurrent > 0 ? marketCap / priceCurrent : null);
 
-  return res.json(success({
-    price_current: priceCurrent,
-    price_timestamp: finnhubQuote?.t ? new Date(finnhubQuote.t * 1000).toISOString() : new Date().toISOString(),
-    market_cap_current: marketCap,
-    enterprise_value_current: marketCap,
-    shares_outstanding_current: sharesOutstanding,
-    beta_snapshot: toNum(fmpProfile?.beta, null),
-    ohlcv
-  }, sourceStatus, warnings));
+  return res.json(
+    success(
+      {
+        price_current: priceCurrent,
+        price_timestamp: finnhubQuote?.t
+          ? new Date(finnhubQuote.t * 1000).toISOString()
+          : new Date().toISOString(),
+        market_cap_current: marketCap,
+        enterprise_value_current: marketCap,
+        shares_outstanding_current: sharesOutstanding,
+        beta_snapshot: toNum(fmpProfile?.beta, null),
+        ohlcv
+      },
+      sourceStatus,
+      warnings
+    )
+  );
 });
 
 app.post("/v1/fundamental-actuals-pack", async (req, res) => {
   const symbol = (req.body.symbol || "").toUpperCase().trim();
-  const annualYears = Math.max(1, Math.min(10, Number(req.body.annual_years || 10)));
-  const quarterlyPeriods = Math.max(1, Math.min(12, Number(req.body.quarterly_periods || 12)));
+  const annualYears = Math.max(
+    1,
+    Math.min(10, Number(req.body.annual_years || 10))
+  );
+  const quarterlyPeriods = Math.max(
+    1,
+    Math.min(12, Number(req.body.quarterly_periods || 12))
+  );
   const includeTtm = req.body.include_ttm !== false;
 
   if (!symbol) {
-    return res.status(400).json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
+    return res
+      .status(400)
+      .json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
   }
 
   const { instrument_type } = classifyLocal(symbol);
   if (!["us_equity", "adr_equity"].includes(instrument_type)) {
     const unsupported = buildUnsupportedActualsPayload(instrument_type);
-    return res.json(success(unsupported.data, unsupported.sourceStatus, unsupported.warnings));
+    return res.json(
+      success(unsupported.data, unsupported.sourceStatus, unsupported.warnings)
+    );
   }
 
-  const cacheKey = buildActualsCacheKey(symbol, annualYears, quarterlyPeriods, includeTtm);
+  const cacheKey = buildActualsCacheKey(
+    symbol,
+    annualYears,
+    quarterlyPeriods,
+    includeTtm
+  );
   const cached = getCacheEntry(actualsCache, cacheKey);
   if (cached) {
-    return res.json(success(
-      cached.data,
-      [{ provider: "cache", status: "ok", note: "fundamental actuals cache hit" }, ...cached.sourceStatus],
-      cached.warnings
-    ));
+    return res.json(
+      success(
+        cached.data,
+        [{ provider: "cache", status: "ok", note: "fundamental actuals cache hit" }, ...cached.sourceStatus],
+        cached.warnings
+      )
+    );
   }
 
   try {
@@ -1233,19 +2050,33 @@ app.post("/v1/fundamental-actuals-pack", async (req, res) => {
     if (!sharedPromise) {
       sharedPromise = (async () => {
         try {
-          return await fetchSecFundamentalActuals(symbol, annualYears, quarterlyPeriods, includeTtm);
+          return await fetchSecFundamentalActuals(
+            symbol,
+            annualYears,
+            quarterlyPeriods,
+            includeTtm
+          );
         } catch (secErr) {
           const secSourceStatus = secErr?.sourceStatus || [];
           const secWarnings = secErr?.warnings || [];
           const secMessage = secErr?.message || "SEC actuals unavailable.";
 
           try {
-            const alphaResult = await fetchAlphaFundamentalActuals(symbol, annualYears, quarterlyPeriods, includeTtm);
+            const alphaResult = await fetchAlphaFundamentalActuals(
+              symbol,
+              annualYears,
+              quarterlyPeriods,
+              includeTtm
+            );
             return {
               data: alphaResult.data,
               sourceStatus: [
                 ...secSourceStatus,
-                { provider: "dispatcher", status: "partial", note: `SEC primary failed; falling back to Alpha Vantage. reason=${secMessage}` },
+                {
+                  provider: "dispatcher",
+                  status: "partial",
+                  note: `SEC primary failed; falling back to Alpha Vantage. reason=${secMessage}`
+                },
                 ...alphaResult.sourceStatus
               ],
               warnings: [
@@ -1255,20 +2086,25 @@ app.post("/v1/fundamental-actuals-pack", async (req, res) => {
               ]
             };
           } catch (alphaErr) {
-            const combined = new Error("Unable to assemble usable fundamental actuals from SEC/Alpha providers.");
+            const combined = new Error(
+              "Unable to assemble usable fundamental actuals from SEC/Alpha providers."
+            );
             combined.isKnownUpstream = true;
-            combined.httpStatus = alphaErr?.httpStatus || secErr?.httpStatus || 502;
-            combined.code = alphaErr?.code || secErr?.code || "ALL_PROVIDERS_UNAVAILABLE";
+            combined.httpStatus =
+              alphaErr?.httpStatus || secErr?.httpStatus || 502;
+            combined.code =
+              alphaErr?.code || secErr?.code || "ALL_PROVIDERS_UNAVAILABLE";
             combined.retryable = !!(alphaErr?.retryable || secErr?.retryable);
             combined.sourceStatus = [
               ...secSourceStatus,
-              { provider: "dispatcher", status: "partial", note: `SEC primary failed; attempting Alpha Vantage fallback. reason=${secMessage}` },
+              {
+                provider: "dispatcher",
+                status: "partial",
+                note: `SEC primary failed; attempting Alpha Vantage fallback. reason=${secMessage}`
+              },
               ...(alphaErr?.sourceStatus || [])
             ];
-            combined.warnings = [
-              ...secWarnings,
-              ...(alphaErr?.warnings || [])
-            ];
+            combined.warnings = [...secWarnings, ...(alphaErr?.warnings || [])];
             throw combined;
           }
         }
@@ -1280,30 +2116,52 @@ app.post("/v1/fundamental-actuals-pack", async (req, res) => {
     setCacheEntry(actualsCache, cacheKey, result, ACTUALS_CACHE_TTL_MS);
 
     const sourceStatus = hadInflight
-      ? [{ provider: "inflight", status: "ok", note: "reused in-flight fundamental actuals request" }, ...result.sourceStatus]
+      ? [
+          {
+            provider: "inflight",
+            status: "ok",
+            note: "reused in-flight fundamental actuals request"
+          },
+          ...result.sourceStatus
+        ]
       : result.sourceStatus;
 
     return res.json(success(result.data, sourceStatus, result.warnings));
   } catch (e) {
     if (e?.isKnownUpstream) {
-      return res.status(e.httpStatus || 502).json(fail(
-        e.code || "ALL_PROVIDERS_UNAVAILABLE",
-        e.message || "Unable to assemble usable fundamental actuals from SEC/Alpha providers.",
-        e.httpStatus || 502,
-        e.sourceStatus || [],
-        e.warnings || [],
-        !!e.retryable
-      ));
+      return res
+        .status(e.httpStatus || 502)
+        .json(
+          fail(
+            e.code || "ALL_PROVIDERS_UNAVAILABLE",
+            e.message ||
+              "Unable to assemble usable fundamental actuals from SEC/Alpha providers.",
+            e.httpStatus || 502,
+            e.sourceStatus || [],
+            e.warnings || [],
+            !!e.retryable
+          )
+        );
     }
 
-    return res.status(502).json(fail(
-      "ALL_PROVIDERS_UNAVAILABLE",
-      "Unable to assemble usable fundamental actuals from SEC/Alpha providers.",
-      502,
-      [{ provider: "dispatcher", status: "partial", note: `unexpected actuals dispatcher failure: ${e.message}` }],
-      [],
-      false
-    ));
+    return res
+      .status(502)
+      .json(
+        fail(
+          "ALL_PROVIDERS_UNAVAILABLE",
+          "Unable to assemble usable fundamental actuals from SEC/Alpha providers.",
+          502,
+          [
+            {
+              provider: "dispatcher",
+              status: "partial",
+              note: `unexpected actuals dispatcher failure: ${e.message}`
+            }
+          ],
+          [],
+          false
+        )
+      );
   } finally {
     actualsInflight.delete(cacheKey);
   }
@@ -1312,101 +2170,129 @@ app.post("/v1/fundamental-actuals-pack", async (req, res) => {
 app.post("/v1/estimates-targets-pack", (req, res) => {
   const symbol = (req.body.symbol || "").toUpperCase().trim();
   if (!symbol) {
-    return res.status(400).json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
+    return res
+      .status(400)
+      .json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
   }
 
-  return res.json(success({
-    eps_fy0_est: 5.0,
-    eps_fy1_est: 5.5,
-    eps_fy2_est: 6.1,
-    revenue_fy0_est: 10000000000,
-    revenue_fy1_est: 11000000000,
-    revenue_fy2_est: 12100000000,
-    target_price_consensus: 100.0,
-    target_price_low: 80.0,
-    target_price_high: 120.0,
-    analyst_count: 10,
-    estimate_revision_direction: "flat"
-  }, [{ provider: "mock", status: "ok", note: "estimates pack still mock in phase 1" }]));
+  return res.json(
+    success(
+      {
+        eps_fy0_est: 5.0,
+        eps_fy1_est: 5.5,
+        eps_fy2_est: 6.1,
+        revenue_fy0_est: 10000000000,
+        revenue_fy1_est: 11000000000,
+        revenue_fy2_est: 12100000000,
+        target_price_consensus: 100.0,
+        target_price_low: 80.0,
+        target_price_high: 120.0,
+        analyst_count: 10,
+        estimate_revision_direction: "flat"
+      },
+      [{ provider: "mock", status: "ok", note: "estimates pack still mock in phase 1" }]
+    )
+  );
 });
 
 app.post("/v1/macro-breadth-liquidity-pack", (req, res) => {
   const symbol = (req.body.symbol || "").toUpperCase().trim();
   if (!symbol) {
-    return res.status(400).json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
+    return res
+      .status(400)
+      .json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
   }
 
-  return res.json(success({
-    macro_regime: "disinflation_with_stable_growth",
-    market_state: "trend_up_but_narrowing_breadth",
-    liquidity_state: "neutral_to_tightening",
-    should_enter_valuation: "scenario_only",
-    risk_free_rate: 0.0435,
-    yield_curve_slope: 0.0021,
-    usd_context: "slightly_firm",
-    breadth_score: 58.4,
-    breadth_health: "neutral",
-    breadth_notes: [
-      "Cap-weight index leadership remains concentrated",
-      "Participation above 200DMA is healthy but not expanding",
-      "Liquidity backdrop is not fully risk-on"
-    ]
-  }, [{ provider: "mock", status: "ok", note: "macro pack still mock in phase 1" }]));
+  return res.json(
+    success(
+      {
+        macro_regime: "disinflation_with_stable_growth",
+        market_state: "trend_up_but_narrowing_breadth",
+        liquidity_state: "neutral_to_tightening",
+        should_enter_valuation: "scenario_only",
+        risk_free_rate: 0.0435,
+        yield_curve_slope: 0.0021,
+        usd_context: "slightly_firm",
+        breadth_score: 58.4,
+        breadth_health: "neutral",
+        breadth_notes: [
+          "Cap-weight index leadership remains concentrated",
+          "Participation above 200DMA is healthy but not expanding",
+          "Liquidity backdrop is not fully risk-on"
+        ]
+      },
+      [{ provider: "mock", status: "ok", note: "macro pack still mock in phase 1" }]
+    )
+  );
 });
 
 app.post("/v1/filings-transcripts-pack", (req, res) => {
   const symbol = (req.body.symbol || "").toUpperCase().trim();
   if (!symbol) {
-    return res.status(400).json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
+    return res
+      .status(400)
+      .json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
   }
 
-  return res.json(success({
-    filings: [],
-    transcripts: [],
-    guidance_notes: ["filings/transcripts pack still mock in phase 1"]
-  }, [{ provider: "mock", status: "ok", note: "filings/transcripts pack still mock in phase 1" }]));
+  return res.json(
+    success(
+      {
+        filings: [],
+        transcripts: [],
+        guidance_notes: ["filings/transcripts pack still mock in phase 1"]
+      },
+      [{ provider: "mock", status: "ok", note: "filings/transcripts pack still mock in phase 1" }]
+    )
+  );
 });
 
 app.post("/v1/technical-structure-pack", (req, res) => {
   const symbol = (req.body.symbol || "").toUpperCase().trim();
   if (!symbol) {
-    return res.status(400).json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
+    return res
+      .status(400)
+      .json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
   }
 
-  return res.json(success({
-    trend_state: "mixed",
-    momentum_state: "neutral",
-    structure_tags: ["insufficient_context"],
-    key_dates: [],
-    indicators: {
-      ma20: 100,
-      ma50: 98,
-      ma200: 90,
-      rsi14: 50,
-      macd: 0,
-      atr: 2
-    },
-    support_resistance: [
+  return res.json(
+    success(
       {
-        kind: "support",
-        low: 97,
-        high: 99,
-        strength: "medium",
-        basis: ["swing"],
-        note: "mock support zone"
+        trend_state: "mixed",
+        momentum_state: "neutral",
+        structure_tags: ["insufficient_context"],
+        key_dates: [],
+        indicators: {
+          ma20: 100,
+          ma50: 98,
+          ma200: 90,
+          rsi14: 50,
+          macd: 0,
+          atr: 2
+        },
+        support_resistance: [
+          {
+            kind: "support",
+            low: 97,
+            high: 99,
+            strength: "medium",
+            basis: ["swing"],
+            note: "mock support zone"
+          },
+          {
+            kind: "resistance",
+            low: 101,
+            high: 103,
+            strength: "medium",
+            basis: ["swing"],
+            note: "mock resistance zone"
+          }
+        ],
+        valuation_channels_available: false,
+        channel_notes: ["technical structure pack still mock in phase 1"]
       },
-      {
-        kind: "resistance",
-        low: 101,
-        high: 103,
-        strength: "medium",
-        basis: ["swing"],
-        note: "mock resistance zone"
-      }
-    ],
-    valuation_channels_available: false,
-    channel_notes: ["technical structure pack still mock in phase 1"]
-  }, [{ provider: "mock", status: "ok", note: "technical pack still mock in phase 1" }]));
+      [{ provider: "mock", status: "ok", note: "technical pack still mock in phase 1" }]
+    )
+  );
 });
 
 app.get("/", (req, res) => {
