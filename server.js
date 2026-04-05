@@ -9,6 +9,10 @@ const ALPHAVANTAGE_API_KEY = process.env.ALPHAVANTAGE_API_KEY || "";
 const FMP_API_KEY = process.env.FMP_API_KEY || "";
 const MARKETSTACK_ACCESS_KEY = process.env.MARKETSTACK_ACCESS_KEY || "";
 
+const ACTUALS_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const actualsCache = new Map();
+const actualsInflight = new Map();
+
 const success = (data, sourceStatus = [], warnings = []) => ({
   meta: {
     request_id: `req_${Date.now()}`,
@@ -19,7 +23,7 @@ const success = (data, sourceStatus = [], warnings = []) => ({
   data
 });
 
-const fail = (code, message, httpStatus = 400, sourceStatus = [], warnings = []) => ({
+const fail = (code, message, httpStatus = 400, sourceStatus = [], warnings = [], retryable = false) => ({
   meta: {
     request_id: `req_${Date.now()}`,
     generated_at: new Date().toISOString(),
@@ -30,7 +34,7 @@ const fail = (code, message, httpStatus = 400, sourceStatus = [], warnings = [])
     http_status: httpStatus,
     code,
     message,
-    retryable: false
+    retryable
   }
 });
 
@@ -154,12 +158,74 @@ function buildFinnhubOHLCV(candles) {
   );
 }
 
-function alphaHasRateLimitOrError(payload) {
-  return !!(
+function alphaExtractProblem(payload) {
+  if (!payload || typeof payload !== "object") return null;
+
+  const raw =
     payload?.Note ||
     payload?.Information ||
-    payload?.["Error Message"]
-  );
+    payload?.["Error Message"] ||
+    null;
+
+  if (!raw) return null;
+
+  const message = String(raw);
+  const lower = message.toLowerCase();
+
+  if (payload?.["Error Message"]) {
+    return {
+      code: "ALPHAVANTAGE_UPSTREAM_ERROR",
+      message,
+      httpStatus: 502,
+      retryable: false
+    };
+  }
+
+  if (lower.includes("per minute")) {
+    return {
+      code: "ALPHAVANTAGE_RATE_LIMIT_PER_MINUTE",
+      message,
+      httpStatus: 429,
+      retryable: true
+    };
+  }
+
+  if (lower.includes("25 requests per day") || lower.includes("25 calls per day") || lower.includes("per day")) {
+    return {
+      code: "ALPHAVANTAGE_RATE_LIMIT_PER_DAY",
+      message,
+      httpStatus: 429,
+      retryable: false
+    };
+  }
+
+  if (lower.includes("premium")) {
+    return {
+      code: "ALPHAVANTAGE_PREMIUM_OR_PLAN_LIMIT",
+      message,
+      httpStatus: 429,
+      retryable: false
+    };
+  }
+
+  return {
+    code: "ALPHAVANTAGE_NOTE_OR_INFORMATION",
+    message,
+    httpStatus: 502,
+    retryable: false
+  };
+}
+
+function alphaHasRateLimitOrError(payload) {
+  return !!alphaExtractProblem(payload);
+}
+
+function alphaProblemToSourceStatus(provider, problem) {
+  return {
+    provider,
+    status: "partial",
+    note: problem?.message || "alpha returned note/error payload"
+  };
 }
 
 function alphaExtractGlobalQuote(payload) {
@@ -271,6 +337,70 @@ function buildMarketstackOHLCV(payload, maxPoints = 252) {
         x.volume !== null
     )
     .sort((a, b) => a.ts.localeCompare(b.ts));
+}
+
+function cleanupExpiredActualsCache() {
+  const now = Date.now();
+  for (const [key, entry] of actualsCache.entries()) {
+    if (!entry || entry.expiresAt <= now) {
+      actualsCache.delete(key);
+    }
+  }
+}
+
+function buildActualsCacheKey(symbol, annualYears, quarterlyPeriods, includeTtm) {
+  return `${symbol}__a${annualYears}__q${quarterlyPeriods}__ttm${includeTtm ? 1 : 0}`;
+}
+
+function getActualsCacheEntry(cacheKey) {
+  cleanupExpiredActualsCache();
+  const entry = actualsCache.get(cacheKey);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    actualsCache.delete(cacheKey);
+    return null;
+  }
+  return entry.value;
+}
+
+function setActualsCacheEntry(cacheKey, value) {
+  actualsCache.set(cacheKey, {
+    expiresAt: Date.now() + ACTUALS_CACHE_TTL_MS,
+    value
+  });
+}
+
+function buildEmptyTtm() {
+  return {
+    fiscal_period: "TTM",
+    fiscal_year: null,
+    period_type: "ttm",
+    period_end: null,
+    filing_date: null,
+    revenue: null,
+    gross_profit: null,
+    ebit: null,
+    ebitda: null,
+    net_income: null,
+    eps_gaap: null,
+    eps_nongaap: null,
+    cfo: null,
+    capex: null,
+    fcff: null,
+    cash: null,
+    debt: null,
+    net_cash: null,
+    diluted_shares: null,
+    gross_margin: null,
+    ebit_margin: null,
+    fcf_margin: null,
+    roe: null,
+    roic: null
+  };
+}
+
+function periodsNeedShares(rows = []) {
+  return rows.some((row) => row?.diluted_shares === null || row?.diluted_shares === undefined);
 }
 
 function formatDateYYYYMMDD(dateObj) {
@@ -426,7 +556,7 @@ function buildAlphaUnifiedPeriods(incomeRows, balanceRows, cashRows, sharesRows,
   });
 }
 
-function buildAlphaTTM(incomeQuarterly, balanceQuarterly, cashQuarterly, sharesQuarterly) {
+function buildAlphaTTM(incomeQuarterly, balanceQuarterly, cashQuarterly, sharesQuarterly = []) {
   const iq = [...incomeQuarterly].slice(0, 4);
   const cq = [...cashQuarterly].slice(0, 4);
   const b0 = balanceQuarterly[0] || {};
@@ -451,6 +581,13 @@ function buildAlphaTTM(incomeQuarterly, balanceQuarterly, cashQuarterly, sharesQ
     return vals.length > 0 ? vals.reduce((a, b) => a + b, 0) : null;
   })();
 
+  const quarterlyEpsSum = (() => {
+    const vals = iq
+      .map((r) => toNum(alphaChoose(r.reportedEPS, r.dilutedEPS, r.eps), null))
+      .filter((v) => v !== null);
+    return vals.length > 0 ? vals.reduce((a, b) => a + b, 0) : null;
+  })();
+
   const fcff = (cfo !== null && capexAbs !== null) ? (cfo - capexAbs) : null;
 
   const cash = toNum(alphaChoose(
@@ -471,6 +608,12 @@ function buildAlphaTTM(incomeQuarterly, balanceQuarterly, cashQuarterly, sharesQ
     sq.commonSharesOutstanding
   ), null);
 
+  const epsFromNetIncome = dilutedShares && dilutedShares !== 0 && netIncome !== null
+    ? netIncome / dilutedShares
+    : null;
+
+  const epsTtm = epsFromNetIncome ?? quarterlyEpsSum;
+
   return {
     fiscal_period: "TTM",
     fiscal_year: null,
@@ -482,8 +625,8 @@ function buildAlphaTTM(incomeQuarterly, balanceQuarterly, cashQuarterly, sharesQ
     ebit,
     ebitda,
     net_income: netIncome,
-    eps_gaap: dilutedShares && dilutedShares !== 0 && netIncome !== null ? netIncome / dilutedShares : null,
-    eps_nongaap: dilutedShares && dilutedShares !== 0 && netIncome !== null ? netIncome / dilutedShares : null,
+    eps_gaap: epsTtm,
+    eps_nongaap: epsTtm,
     cfo,
     capex: capexAbs,
     fcff,
@@ -496,6 +639,147 @@ function buildAlphaTTM(incomeQuarterly, balanceQuarterly, cashQuarterly, sharesQ
     fcf_margin: revenue !== null && fcff !== null && revenue !== 0 ? fcff / revenue : null,
     roe: null,
     roic: null
+  };
+}
+
+async function fetchAlphaFundamentalActuals(symbol, annualYears, quarterlyPeriods, includeTtm) {
+  const sourceStatus = [];
+  const warnings = [];
+
+  const [incomeRaw, balanceRaw, cashRaw] = await Promise.all([
+    alphaGet({ function: "INCOME_STATEMENT", symbol }),
+    alphaGet({ function: "BALANCE_SHEET", symbol }),
+    alphaGet({ function: "CASH_FLOW", symbol })
+  ]);
+
+  const coreProblems = [
+    alphaExtractProblem(incomeRaw),
+    alphaExtractProblem(balanceRaw),
+    alphaExtractProblem(cashRaw)
+  ].filter(Boolean);
+
+  if (coreProblems.length > 0) {
+    for (const problem of coreProblems) {
+      sourceStatus.push(alphaProblemToSourceStatus("alpha_vantage_core", problem));
+    }
+
+    const primaryProblem = coreProblems[0];
+    const knownError = new Error("Alpha Vantage returned a note/error payload for core statement endpoints.");
+    knownError.isKnownUpstream = true;
+    knownError.httpStatus = primaryProblem.httpStatus;
+    knownError.code = primaryProblem.code;
+    knownError.retryable = primaryProblem.retryable;
+    knownError.sourceStatus = sourceStatus;
+    knownError.warnings = warnings;
+    knownError.message = "Alpha Vantage returned a note/error payload instead of usable core fundamental statements.";
+    throw knownError;
+  }
+
+  const income = normalizeAlphaReports(incomeRaw);
+  const balance = normalizeAlphaReports(balanceRaw);
+  const cash = normalizeAlphaReports(cashRaw);
+
+  let annuals = buildAlphaUnifiedPeriods(
+    income.annual.slice(0, annualYears),
+    balance.annual.slice(0, annualYears),
+    cash.annual.slice(0, annualYears),
+    [],
+    "annual"
+  );
+
+  let quarterlies = buildAlphaUnifiedPeriods(
+    income.quarterly.slice(0, quarterlyPeriods),
+    balance.quarterly.slice(0, quarterlyPeriods),
+    cash.quarterly.slice(0, quarterlyPeriods),
+    [],
+    "quarterly"
+  );
+
+  let ttm = includeTtm
+    ? buildAlphaTTM(
+        income.quarterly.slice(0, 4),
+        balance.quarterly.slice(0, 1),
+        cash.quarterly.slice(0, 4),
+        []
+      )
+    : buildEmptyTtm();
+
+  if (annuals.length === 0 && quarterlies.length === 0) {
+    const knownError = new Error("Alpha Vantage returned empty statement arrays.");
+    knownError.isKnownUpstream = true;
+    knownError.httpStatus = 502;
+    knownError.code = "ALPHAVANTAGE_EMPTY_STATEMENTS";
+    knownError.retryable = true;
+    knownError.sourceStatus = [
+      {
+        provider: "alpha_vantage_core",
+        status: "partial",
+        note: "alpha income/balance/cashflow payload was structurally valid but contained no statement rows"
+      }
+    ];
+    knownError.warnings = warnings;
+    knownError.message = "Alpha Vantage returned empty statement arrays for the requested symbol.";
+    throw knownError;
+  }
+
+  sourceStatus.push({ provider: "alpha_vantage_core", status: "ok", note: "alpha income/balance/cashflow loaded" });
+
+  const needShares = periodsNeedShares(annuals) || periodsNeedShares(quarterlies) || (includeTtm && (ttm?.diluted_shares === null || ttm?.diluted_shares === undefined));
+
+  if (needShares) {
+    try {
+      const sharesRaw = await alphaGet({ function: "SHARES_OUTSTANDING", symbol });
+      const sharesProblem = alphaExtractProblem(sharesRaw);
+
+      if (sharesProblem) {
+        sourceStatus.push(alphaProblemToSourceStatus("alpha_vantage_shares", sharesProblem));
+        warnings.push("Alpha shares endpoint returned note/error payload; continuing without diluted_shares enrichment where unavailable.");
+      } else {
+        const shares = normalizeAlphaShares(sharesRaw);
+
+        annuals = buildAlphaUnifiedPeriods(
+          income.annual.slice(0, annualYears),
+          balance.annual.slice(0, annualYears),
+          cash.annual.slice(0, annualYears),
+          shares.annual.slice(0, annualYears),
+          "annual"
+        );
+
+        quarterlies = buildAlphaUnifiedPeriods(
+          income.quarterly.slice(0, quarterlyPeriods),
+          balance.quarterly.slice(0, quarterlyPeriods),
+          cash.quarterly.slice(0, quarterlyPeriods),
+          shares.quarterly.slice(0, quarterlyPeriods),
+          "quarterly"
+        );
+
+        ttm = includeTtm
+          ? buildAlphaTTM(
+              income.quarterly.slice(0, 4),
+              balance.quarterly.slice(0, 1),
+              cash.quarterly.slice(0, 4),
+              shares.quarterly.slice(0, 1)
+            )
+          : buildEmptyTtm();
+
+        sourceStatus.push({ provider: "alpha_vantage_shares", status: "ok", note: "alpha shares outstanding loaded" });
+      }
+    } catch (e) {
+      sourceStatus.push({ provider: "alpha_vantage_shares", status: "partial", note: `alpha shares outstanding unavailable: ${e.message}` });
+      warnings.push("Alpha shares endpoint failed; continuing without diluted_shares enrichment where unavailable.");
+    }
+  } else {
+    sourceStatus.push({ provider: "alpha_vantage_shares", status: "ok", note: "shares endpoint skipped because core statement payload was already sufficient" });
+  }
+
+  return {
+    data: {
+      annuals,
+      quarterlies,
+      ttm
+    },
+    sourceStatus,
+    warnings
   };
 }
 
@@ -792,110 +1076,60 @@ app.post("/v1/fundamental-actuals-pack", async (req, res) => {
     return res.status(400).json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
   }
 
-  const sourceStatus = [];
-  const warnings = [];
+  const cacheKey = buildActualsCacheKey(symbol, annualYears, quarterlyPeriods, includeTtm);
+  const cached = getActualsCacheEntry(cacheKey);
+
+  if (cached) {
+    return res.json(success(
+      cached.data,
+      [{ provider: "cache", status: "ok", note: "fundamental actuals cache hit" }, ...cached.sourceStatus],
+      cached.warnings
+    ));
+  }
 
   try {
-    const [incomeRaw, balanceRaw, cashRaw, sharesRaw] = await Promise.all([
-      alphaGet({ function: "INCOME_STATEMENT", symbol }),
-      alphaGet({ function: "BALANCE_SHEET", symbol }),
-      alphaGet({ function: "CASH_FLOW", symbol }),
-      alphaGet({ function: "SHARES_OUTSTANDING", symbol })
-    ]);
+    let sharedPromise = actualsInflight.get(cacheKey);
+    const hadInflight = !!sharedPromise;
 
-    if (
-      alphaHasRateLimitOrError(incomeRaw) ||
-      alphaHasRateLimitOrError(balanceRaw) ||
-      alphaHasRateLimitOrError(cashRaw) ||
-      alphaHasRateLimitOrError(sharesRaw)
-    ) {
-      const note =
-        incomeRaw?.Note || incomeRaw?.Information || incomeRaw?.["Error Message"] ||
-        balanceRaw?.Note || balanceRaw?.Information || balanceRaw?.["Error Message"] ||
-        cashRaw?.Note || cashRaw?.Information || cashRaw?.["Error Message"] ||
-        sharesRaw?.Note || sharesRaw?.Information || sharesRaw?.["Error Message"] ||
-        "alpha returned note/error payload";
-      sourceStatus.push({ provider: "alpha_vantage", status: "partial", note });
-      return res.status(502).json(fail(
-        "UPSTREAM_PARTIAL_DATA",
-        "Alpha Vantage returned a note/error payload instead of usable fundamental actuals.",
-        502,
-        sourceStatus,
-        warnings
+    if (!sharedPromise) {
+      sharedPromise = fetchAlphaFundamentalActuals(symbol, annualYears, quarterlyPeriods, includeTtm);
+      actualsInflight.set(cacheKey, sharedPromise);
+    }
+
+    const result = await sharedPromise;
+    setActualsCacheEntry(cacheKey, result);
+
+    const sourceStatus = hadInflight
+      ? [{ provider: "inflight", status: "ok", note: "reused in-flight fundamental actuals request" }, ...result.sourceStatus]
+      : result.sourceStatus;
+
+    return res.json(success(result.data, sourceStatus, result.warnings));
+  } catch (e) {
+    if (e?.isKnownUpstream) {
+      return res.status(e.httpStatus || 502).json(fail(
+        e.code || "UPSTREAM_PARTIAL_DATA",
+        e.message || "Unable to assemble usable fundamental actuals from Alpha Vantage endpoints.",
+        e.httpStatus || 502,
+        e.sourceStatus || [],
+        e.warnings || [],
+        !!e.retryable
       ));
     }
 
-    const income = normalizeAlphaReports(incomeRaw);
-    const balance = normalizeAlphaReports(balanceRaw);
-    const cash = normalizeAlphaReports(cashRaw);
-    const shares = normalizeAlphaShares(sharesRaw);
+    const sourceStatus = [
+      { provider: "alpha_vantage_core", status: "partial", note: `alpha fundamental actuals unavailable: ${e.message}` }
+    ];
 
-    const annuals = buildAlphaUnifiedPeriods(
-      income.annual.slice(0, annualYears),
-      balance.annual.slice(0, annualYears),
-      cash.annual.slice(0, annualYears),
-      shares.annual.slice(0, annualYears),
-      "annual"
-    );
-
-    const quarterlies = buildAlphaUnifiedPeriods(
-      income.quarterly.slice(0, quarterlyPeriods),
-      balance.quarterly.slice(0, quarterlyPeriods),
-      cash.quarterly.slice(0, quarterlyPeriods),
-      shares.quarterly.slice(0, quarterlyPeriods),
-      "quarterly"
-    );
-
-    const ttm = includeTtm
-      ? buildAlphaTTM(
-          income.quarterly.slice(0, 4),
-          balance.quarterly.slice(0, 1),
-          cash.quarterly.slice(0, 4),
-          shares.quarterly.slice(0, 1)
-        )
-      : {
-          fiscal_period: "TTM",
-          fiscal_year: null,
-          period_type: "ttm",
-          period_end: null,
-          filing_date: null,
-          revenue: null,
-          gross_profit: null,
-          ebit: null,
-          ebitda: null,
-          net_income: null,
-          eps_gaap: null,
-          eps_nongaap: null,
-          cfo: null,
-          capex: null,
-          fcff: null,
-          cash: null,
-          debt: null,
-          net_cash: null,
-          diluted_shares: null,
-          gross_margin: null,
-          ebit_margin: null,
-          fcf_margin: null,
-          roe: null,
-          roic: null
-        };
-
-    sourceStatus.push({ provider: "alpha_vantage", status: "ok", note: "alpha income/balance/cashflow/shares loaded" });
-
-    return res.json(success({
-      annuals,
-      quarterlies,
-      ttm
-    }, sourceStatus, warnings));
-  } catch (e) {
-    sourceStatus.push({ provider: "alpha_vantage", status: "partial", note: `alpha fundamental actuals unavailable: ${e.message}` });
     return res.status(502).json(fail(
       "ALL_PROVIDERS_UNAVAILABLE",
       "Unable to assemble usable fundamental actuals from Alpha Vantage endpoints.",
       502,
       sourceStatus,
-      warnings
+      [],
+      false
     ));
+  } finally {
+    actualsInflight.delete(cacheKey);
   }
 });
 
