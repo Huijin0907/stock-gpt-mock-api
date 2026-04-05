@@ -86,9 +86,9 @@ async function alphaGet(params = {}) {
   return resp.data;
 }
 
-async function fmpGet(path, params = {}) {
+async function fmpStableGet(path, params = {}) {
   if (!FMP_API_KEY) throw new Error("FMP_API_KEY missing");
-  const resp = await axios.get(`https://financialmodelingprep.com${path}`, {
+  const resp = await axios.get(`https://financialmodelingprep.com/stable/${path}`, {
     params: { ...params, apikey: FMP_API_KEY },
     timeout: 15000
   });
@@ -103,12 +103,12 @@ function mapFinnhubProfileToSecurityMaster(symbol, profile, fmpProfile = null) {
   return {
     symbol,
     security_name: profile?.name || fmpProfile?.companyName || symbol,
-    exchange: profile?.exchange || fmpProfile?.exchangeShortName || "",
+    exchange: profile?.exchange || fmpProfile?.exchange || "",
     country: profile?.country || fmpProfile?.country || "",
     sector: fmpProfile?.sector || profile?.finnhubIndustry || "",
     industry: fmpProfile?.industry || profile?.finnhubIndustry || "",
-    trading_currency: profile?.currency || "USD",
-    reporting_currency: profile?.currency || "USD",
+    trading_currency: profile?.currency || fmpProfile?.currency || "USD",
+    reporting_currency: profile?.currency || fmpProfile?.currency || "USD",
     fiscal_year_end: knownFiscalYearEnd[symbol] || "12-31",
     is_adr,
     adr_ratio,
@@ -196,6 +196,48 @@ function buildAlphaOHLCV(alphaSeries, maxPoints = 120) {
     );
 }
 
+function normalizeFmpProfile(payload) {
+  if (!payload) return null;
+  if (Array.isArray(payload) && payload.length > 0) return payload[0];
+  if (typeof payload === "object" && !Array.isArray(payload)) return payload;
+  return null;
+}
+
+function buildFmpOHLCV(payload, maxPoints = 252) {
+  let rows = [];
+
+  if (Array.isArray(payload)) {
+    rows = payload;
+  } else if (payload?.historical && Array.isArray(payload.historical)) {
+    rows = payload.historical;
+  } else if (payload?.data && Array.isArray(payload.data)) {
+    rows = payload.data;
+  } else if (payload?.results && Array.isArray(payload.results)) {
+    rows = payload.results;
+  }
+
+  return rows
+    .slice(0, maxPoints)
+    .map((r) => ({
+      ts: r.date ? new Date(`${r.date}T00:00:00Z`).toISOString() : null,
+      open: toNum(r.open, null),
+      high: toNum(r.high, null),
+      low: toNum(r.low, null),
+      close: toNum(r.close, null),
+      volume: toNum(r.volume, null)
+    }))
+    .filter(
+      (x) =>
+        x.ts &&
+        x.open !== null &&
+        x.high !== null &&
+        x.low !== null &&
+        x.close !== null &&
+        x.volume !== null
+    )
+    .sort((a, b) => a.ts.localeCompare(b.ts));
+}
+
 app.post("/v1/classify-instrument", (req, res) => {
   const symbol = (req.body.symbol || "").toUpperCase().trim();
   if (!symbol) {
@@ -227,19 +269,16 @@ app.post("/v1/security-master", async (req, res) => {
   let fmpProfile = null;
 
   try {
-    if (FMP_API_KEY) {
-      const fmpData = await fmpGet(`/api/v3/profile/${symbol}`);
-      if (Array.isArray(fmpData) && fmpData.length > 0) {
-        fmpProfile = fmpData[0];
-        sourceStatus.push({ provider: "fmp", status: "ok", note: "fmp profile augment loaded" });
-      } else {
-        sourceStatus.push({ provider: "fmp", status: "partial", note: "fmp profile empty" });
-      }
+    const fmpData = await fmpStableGet("profile", { symbol });
+    fmpProfile = normalizeFmpProfile(fmpData);
+
+    if (fmpProfile) {
+      sourceStatus.push({ provider: "fmp", status: "ok", note: "fmp stable profile loaded" });
     } else {
-      sourceStatus.push({ provider: "fmp", status: "partial", note: "fmp api key missing" });
+      sourceStatus.push({ provider: "fmp", status: "partial", note: "fmp stable profile empty" });
     }
   } catch (e) {
-    sourceStatus.push({ provider: "fmp", status: "partial", note: `fmp profile unavailable: ${e.message}` });
+    sourceStatus.push({ provider: "fmp", status: "partial", note: `fmp stable profile unavailable: ${e.message}` });
   }
 
   try {
@@ -268,7 +307,7 @@ app.post("/v1/security-master", async (req, res) => {
     return res.json(success({
       symbol,
       security_name: fmpProfile.companyName || symbol,
-      exchange: fmpProfile.exchangeShortName || "",
+      exchange: fmpProfile.exchange || "",
       country: fmpProfile.country || "",
       sector: fmpProfile.sector || "",
       industry: fmpProfile.industry || "",
@@ -278,7 +317,7 @@ app.post("/v1/security-master", async (req, res) => {
       is_adr,
       adr_ratio,
       framework_id
-    }, sourceStatus, ["Primary source unavailable, using FMP fallback for security master."]));
+    }, sourceStatus, ["Primary source unavailable, using FMP stable fallback for security master."]));
   }
 
   return res.status(502).json(fail(
@@ -302,184 +341,157 @@ app.post("/v1/market-price-pack", async (req, res) => {
   const nowSec = Math.floor(Date.now() / 1000);
   const fromSec = nowSec - historyYears * 365 * 24 * 60 * 60;
 
+  let finnhubQuote = null;
+  let finnhubProfile = null;
+  let finnhubOHLCV = [];
   let fmpProfile = null;
-  try {
-    if (FMP_API_KEY) {
-      const fmpData = await fmpGet(`/api/v3/profile/${symbol}`);
-      if (Array.isArray(fmpData) && fmpData.length > 0) {
-        fmpProfile = fmpData[0];
-        sourceStatus.push({ provider: "fmp", status: "ok", note: "fmp profile augment loaded" });
-      } else {
-        sourceStatus.push({ provider: "fmp", status: "partial", note: "fmp profile empty" });
-      }
-    } else {
-      sourceStatus.push({ provider: "fmp", status: "partial", note: "fmp api key missing" });
-    }
-  } catch (e) {
-    sourceStatus.push({ provider: "fmp", status: "partial", note: `fmp profile unavailable: ${e.message}` });
-  }
+  let fmpOHLCV = [];
 
+  // 1) Finnhub quote/profile as primary snapshot
   try {
-    const [quote, profile, candles] = await Promise.all([
+    const [quote, profile] = await Promise.all([
       finnhubGet("/quote", { symbol }),
-      finnhubGet("/stock/profile2", { symbol }),
-      finnhubGet("/stock/candle", {
-        symbol,
-        resolution: "D",
-        from: fromSec,
-        to: nowSec
-      })
+      finnhubGet("/stock/profile2", { symbol })
     ]);
 
     const priceCurrent = toNum(quote?.c, null);
-    const ohlcv = buildFinnhubOHLCV(candles);
 
-    const finnhubFailureReasons = [];
-    if (priceCurrent === null) finnhubFailureReasons.push("quote missing c");
-    if (!candles) finnhubFailureReasons.push("candles payload missing");
-    if (candles && candles.s !== "ok") finnhubFailureReasons.push(`candles status ${String(candles.s)}`);
-    if (candles && Array.isArray(candles.t) && candles.t.length === 0) finnhubFailureReasons.push("candles empty");
-    if (ohlcv.length === 0) finnhubFailureReasons.push("ohlcv normalized empty");
-
-    if (priceCurrent === null || ohlcv.length === 0) {
-      throw new Error(finnhubFailureReasons.join("; ") || "finnhub market pack incomplete");
+    if (priceCurrent === null) {
+      throw new Error("finnhub quote missing c");
     }
 
-    const sharesOutstanding =
-      isNonEmpty(fmpProfile?.sharesOutstanding)
-        ? toNum(fmpProfile.sharesOutstanding, null)
-        : isNonEmpty(profile?.shareOutstanding)
-          ? toNum(profile.shareOutstanding, null) * 1000000
-          : null;
-
-    const marketCap =
-      isNonEmpty(fmpProfile?.mktCap)
-        ? toNum(fmpProfile.mktCap, null)
-        : sharesOutstanding !== null
-          ? sharesOutstanding * priceCurrent
-          : null;
-
-    const beta =
-      isNonEmpty(fmpProfile?.beta) ? toNum(fmpProfile.beta, null) : null;
-
-    sourceStatus.unshift({ provider: "finnhub", status: "ok", note: "primary quote/profile/candles loaded" });
-
-    return res.json(success({
-      price_current: priceCurrent,
-      price_timestamp: quote?.t ? new Date(quote.t * 1000).toISOString() : new Date().toISOString(),
-      market_cap_current: marketCap,
-      enterprise_value_current: marketCap,
-      shares_outstanding_current: sharesOutstanding,
-      beta_snapshot: beta,
-      ohlcv
-    }, sourceStatus, warnings));
+    finnhubQuote = quote;
+    finnhubProfile = profile || null;
+    sourceStatus.push({ provider: "finnhub", status: "ok", note: "finnhub quote/profile loaded" });
   } catch (e) {
-    sourceStatus.unshift({
-      provider: "finnhub",
-      status: "partial",
-      note: `primary market pack unavailable: ${e.message}`
-    });
-    warnings.push("Finnhub market pack unavailable, attempting Alpha fallback.");
+    sourceStatus.push({ provider: "finnhub", status: "partial", note: `finnhub quote/profile unavailable: ${e.message}` });
   }
 
+  // 2) Finnhub candles try, but no longer mandatory
   try {
-    if (!ALPHAVANTAGE_API_KEY) {
-      throw new Error("ALPHAVANTAGE_API_KEY missing");
-    }
+    const candles = await finnhubGet("/stock/candle", {
+      symbol,
+      resolution: "D",
+      from: fromSec,
+      to: nowSec
+    });
 
-    const [quoteRaw, dailyRaw] = await Promise.all([
-      alphaGet({ function: "GLOBAL_QUOTE", symbol }),
-      alphaGet({ function: "TIME_SERIES_DAILY", symbol, outputsize: "compact" })
+    finnhubOHLCV = buildFinnhubOHLCV(candles);
+
+    if (finnhubOHLCV.length > 0) {
+      sourceStatus.push({ provider: "finnhub_candles", status: "ok", note: "finnhub candles loaded" });
+    } else {
+      sourceStatus.push({
+        provider: "finnhub_candles",
+        status: "partial",
+        note: `finnhub candles unavailable: status=${String(candles?.s)}`
+      });
+    }
+  } catch (e) {
+    sourceStatus.push({ provider: "finnhub_candles", status: "partial", note: `finnhub candles unavailable: ${e.message}` });
+  }
+
+  // 3) FMP stable profile + historical daily fallback
+  try {
+    const [profileData, historicalData] = await Promise.all([
+      fmpStableGet("profile", { symbol }),
+      fmpStableGet("historical-price-eod/full", { symbol })
     ]);
 
-    if (alphaHasRateLimitOrError(quoteRaw) || alphaHasRateLimitOrError(dailyRaw)) {
-      const note =
-        quoteRaw?.Note ||
-        quoteRaw?.Information ||
-        quoteRaw?.["Error Message"] ||
-        dailyRaw?.Note ||
-        dailyRaw?.Information ||
-        dailyRaw?.["Error Message"] ||
-        "alpha returned note/error payload";
+    fmpProfile = normalizeFmpProfile(profileData);
+    fmpOHLCV = buildFmpOHLCV(historicalData, Math.min(252 * historyYears, 2520));
 
-      sourceStatus.push({ provider: "alpha_vantage", status: "partial", note });
-
-      return res.status(502).json(fail(
-        "UPSTREAM_PARTIAL_DATA",
-        "Alpha Vantage returned a note/error payload instead of usable market data.",
-        502,
-        sourceStatus,
-        warnings
-      ));
+    if (fmpProfile) {
+      sourceStatus.push({ provider: "fmp", status: "ok", note: "fmp stable profile loaded" });
+    } else {
+      sourceStatus.push({ provider: "fmp", status: "partial", note: "fmp stable profile empty" });
     }
 
-    const quote = alphaExtractGlobalQuote(quoteRaw);
-    const ohlcv = buildAlphaOHLCV(dailyRaw?.["Time Series (Daily)"], 120);
-
-    const alphaReasons = [];
-    if (!quote) alphaReasons.push("global quote missing usable fields");
-    if (ohlcv.length === 0) alphaReasons.push("daily series empty");
-
-    if (!quote || ohlcv.length === 0) {
-      sourceStatus.push({
-        provider: "alpha_vantage",
-        status: "partial",
-        note: alphaReasons.join("; ") || "alpha payload missing usable quote/daily fields"
-      });
-
-      return res.status(502).json(fail(
-        "UPSTREAM_PARTIAL_DATA",
-        "Alpha Vantage response did not contain usable quote/time-series data.",
-        502,
-        sourceStatus,
-        warnings
-      ));
+    if (fmpOHLCV.length > 0) {
+      sourceStatus.push({ provider: "fmp_history", status: "ok", note: "fmp historical eod loaded" });
+    } else {
+      sourceStatus.push({ provider: "fmp_history", status: "partial", note: "fmp historical eod empty" });
     }
-
-    const sharesOutstanding =
-      isNonEmpty(fmpProfile?.sharesOutstanding)
-        ? toNum(fmpProfile.sharesOutstanding, null)
-        : null;
-
-    const marketCap =
-      isNonEmpty(fmpProfile?.mktCap)
-        ? toNum(fmpProfile.mktCap, null)
-        : sharesOutstanding !== null && quote.c !== null
-          ? sharesOutstanding * quote.c
-          : null;
-
-    const beta =
-      isNonEmpty(fmpProfile?.beta) ? toNum(fmpProfile.beta, null) : null;
-
-    sourceStatus.push({ provider: "alpha_vantage", status: "ok", note: "alpha quote/daily fallback loaded" });
-
-    return res.json(success({
-      price_current: quote.c,
-      price_timestamp: new Date().toISOString(),
-      market_cap_current: marketCap,
-      enterprise_value_current: marketCap,
-      shares_outstanding_current: sharesOutstanding,
-      beta_snapshot: beta,
-      ohlcv
-    }, sourceStatus, warnings));
   } catch (e) {
-    if (!sourceStatus.some((s) => s.provider === "alpha_vantage")) {
-      sourceStatus.push({
-        provider: "alpha_vantage",
-        status: "partial",
-        note: `alpha fallback unavailable: ${e.message}`
-      });
+    sourceStatus.push({ provider: "fmp", status: "partial", note: `fmp stable fallback unavailable: ${e.message}` });
+  }
+
+  // 4) choose best available price snapshot
+  let priceCurrent = toNum(finnhubQuote?.c, null);
+  if (priceCurrent === null && fmpProfile) {
+    priceCurrent = toNum(fmpProfile.price, null);
+    if (priceCurrent !== null) {
+      warnings.push("Using FMP profile price fallback because Finnhub quote was unavailable.");
     }
   }
 
-  return res.status(502).json(fail(
-    "ALL_PROVIDERS_UNAVAILABLE",
-    "Unable to load market pack from Finnhub/Alpha.",
-    502,
-    sourceStatus,
-    warnings
-  ));
+  // 5) choose best available ohlcv
+  let ohlcv = finnhubOHLCV.length > 0 ? finnhubOHLCV : fmpOHLCV;
+  if (ohlcv.length === 0 && ALPHAVANTAGE_API_KEY) {
+    try {
+      const dailyRaw = await alphaGet({
+        function: "TIME_SERIES_DAILY",
+        symbol,
+        outputsize: "compact"
+      });
+
+      if (alphaHasRateLimitOrError(dailyRaw)) {
+        const note =
+          dailyRaw?.Note ||
+          dailyRaw?.Information ||
+          dailyRaw?.["Error Message"] ||
+          "alpha returned note/error payload";
+        sourceStatus.push({ provider: "alpha_vantage", status: "partial", note });
+      } else {
+        const alphaOHLCV = buildAlphaOHLCV(dailyRaw?.["Time Series (Daily)"], 120);
+        if (alphaOHLCV.length > 0) {
+          ohlcv = alphaOHLCV;
+          sourceStatus.push({ provider: "alpha_vantage", status: "ok", note: "alpha daily fallback loaded" });
+          warnings.push("Using Alpha Vantage fallback for OHLCV.");
+        } else {
+          sourceStatus.push({ provider: "alpha_vantage", status: "partial", note: "alpha daily payload empty" });
+        }
+      }
+    } catch (e) {
+      sourceStatus.push({ provider: "alpha_vantage", status: "partial", note: `alpha fallback unavailable: ${e.message}` });
+    }
+  }
+
+  if (priceCurrent === null || ohlcv.length === 0) {
+    return res.status(502).json(fail(
+      "ALL_PROVIDERS_UNAVAILABLE",
+      "Unable to assemble a usable market price pack from Finnhub/FMP/Alpha.",
+      502,
+      sourceStatus,
+      warnings
+    ));
+  }
+
+  const marketCap =
+    toNum(fmpProfile?.marketCap, null) ??
+    (toNum(fmpProfile?.sharesOutstanding, null) !== null ? toNum(fmpProfile.sharesOutstanding, null) * priceCurrent : null);
+
+  const sharesOutstanding =
+    toNum(fmpProfile?.sharesOutstanding, null) ??
+    (marketCap !== null && priceCurrent > 0 ? marketCap / priceCurrent : null);
+
+  const beta =
+    toNum(fmpProfile?.beta, null);
+
+  return res.json(success({
+    price_current: priceCurrent,
+    price_timestamp: finnhubQuote?.t ? new Date(finnhubQuote.t * 1000).toISOString() : new Date().toISOString(),
+    market_cap_current: marketCap,
+    enterprise_value_current: marketCap,
+    shares_outstanding_current: sharesOutstanding,
+    beta_snapshot: beta,
+    ohlcv
+  }, sourceStatus, warnings));
 });
+
+/*
+  Remaining endpoints stay mock in this step.
+*/
 
 app.post("/v1/fundamental-actuals-pack", (req, res) => {
   const symbol = (req.body.symbol || "").toUpperCase().trim();
@@ -655,7 +667,16 @@ app.get("/", (req, res) => {
       "/v1/macro-breadth-liquidity-pack",
       "/v1/filings-transcripts-pack",
       "/v1/technical-structure-pack"
-    ]
+    ],
+    live_phase: {
+      security_master: true,
+      market_price_pack: true,
+      fundamental_actuals_pack: false,
+      estimates_targets_pack: false,
+      macro_breadth_liquidity_pack: false,
+      filings_transcripts_pack: false,
+      technical_structure_pack: false
+    }
   });
 });
 
