@@ -82,7 +82,7 @@ async function alphaGet(params = {}) {
   if (!ALPHAVANTAGE_API_KEY) throw new Error("ALPHAVANTAGE_API_KEY missing");
   const resp = await axios.get("https://www.alphavantage.co/query", {
     params: { ...params, apikey: ALPHAVANTAGE_API_KEY },
-    timeout: 15000
+    timeout: 20000
   });
   return resp.data;
 }
@@ -280,114 +280,129 @@ function formatDateYYYYMMDD(dateObj) {
   return `${y}-${m}-${d}`;
 }
 
-function firstArrayOrEmpty(payload) {
-  if (!payload) return [];
-  if (Array.isArray(payload)) return payload;
-  if (Array.isArray(payload?.data)) return payload.data;
-  if (Array.isArray(payload?.results)) return payload.results;
-  return [];
+function normalizeAlphaReports(payload, annualKey = "annualReports", quarterlyKey = "quarterlyReports") {
+  return {
+    annual: Array.isArray(payload?.[annualKey]) ? payload[annualKey] : [],
+    quarterly: Array.isArray(payload?.[quarterlyKey]) ? payload[quarterlyKey] : []
+  };
 }
 
-function firstObject(payload) {
-  const arr = firstArrayOrEmpty(payload);
-  if (arr.length > 0) return arr[0];
-  if (payload && typeof payload === "object" && !Array.isArray(payload)) return payload;
-  return null;
+function normalizeAlphaShares(payload) {
+  const annual =
+    Array.isArray(payload?.annualSharesOutstanding)
+      ? payload.annualSharesOutstanding
+      : [];
+
+  const quarterly =
+    Array.isArray(payload?.quarterlySharesOutstanding)
+      ? payload.quarterlySharesOutstanding
+      : [];
+
+  return { annual, quarterly };
 }
 
-function safeAbsCapex(capex) {
-  if (capex === null || capex === undefined) return null;
-  return Math.abs(Number(capex));
+function buildAlphaSharesMap(rows) {
+  const m = new Map();
+  for (const r of rows) {
+    const key = r.fiscalDateEnding || r.date || null;
+    if (!key) continue;
+    const diluted = toNum(
+      r.dilutedSharesOutstanding ||
+      r.weightedAverageShsOutDil ||
+      r.sharesOutstanding ||
+      r.commonSharesOutstanding,
+      null
+    );
+    if (diluted !== null) m.set(key, diluted);
+  }
+  return m;
 }
 
-function choose(...vals) {
+function alphaChoose(...vals) {
   for (const v of vals) {
     if (v !== null && v !== undefined && v !== "") return v;
   }
   return null;
 }
 
-function buildStatementMapByDate(rows) {
+function buildAlphaStatementMapByDate(rows) {
   const m = new Map();
   for (const r of rows) {
-    const key = choose(r.date, r.fillingDate, r.acceptedDate);
+    const key = r.fiscalDateEnding || r.date || null;
     if (!key) continue;
     m.set(key, r);
   }
   return m;
 }
 
-function buildUnifiedPeriods(incomeRows, balanceRows, cashRows, periodType) {
-  const incomeMap = buildStatementMapByDate(incomeRows);
-  const balanceMap = buildStatementMapByDate(balanceRows);
-  const cashMap = buildStatementMapByDate(cashRows);
+function buildAlphaUnifiedPeriods(incomeRows, balanceRows, cashRows, sharesRows, periodType) {
+  const incomeMap = buildAlphaStatementMapByDate(incomeRows);
+  const balanceMap = buildAlphaStatementMapByDate(balanceRows);
+  const cashMap = buildAlphaStatementMapByDate(cashRows);
+  const sharesMap = buildAlphaSharesMap(sharesRows);
 
   const keys = Array.from(new Set([
     ...incomeMap.keys(),
     ...balanceMap.keys(),
-    ...cashMap.keys()
+    ...cashMap.keys(),
+    ...sharesMap.keys()
   ])).sort().reverse();
 
   return keys.map((key) => {
     const i = incomeMap.get(key) || {};
     const b = balanceMap.get(key) || {};
     const c = cashMap.get(key) || {};
+    const dilutedShares = sharesMap.get(key) ?? null;
 
-    const revenue = toNum(choose(i.revenue), null);
-    const grossProfit = toNum(choose(i.grossProfit), null);
-    const ebit = toNum(choose(i.operatingIncome, i.ebit), null);
-    const ebitda = toNum(choose(i.ebitda), null);
-    const netIncome = toNum(choose(i.netIncome), null);
-    const epsGaap = toNum(choose(i.eps, i.epsdiluted, i.epsDiluted), null);
-    const epsNonGaap = toNum(choose(i.epsdiluted, i.epsDiluted, i.eps), null);
-    const cfo = toNum(choose(
-      c.netCashProvidedByOperatingActivities,
-      c.operatingCashFlow,
-      c.cashFlowFromOperations
+    const revenue = toNum(alphaChoose(i.totalRevenue, i.revenue), null);
+    const grossProfit = toNum(alphaChoose(i.grossProfit), null);
+    const ebit = toNum(alphaChoose(i.operatingIncome, i.ebit), null);
+    const ebitda = toNum(alphaChoose(i.ebitda, i.EBITDA), null);
+    const netIncome = toNum(alphaChoose(i.netIncome), null);
+    const epsGaap = toNum(alphaChoose(i.reportedEPS, i.dilutedEPS, i.eps), null);
+    const epsNonGaap = epsGaap;
+
+    const cfo = toNum(alphaChoose(
+      c.operatingCashflow,
+      c.operatingCashFlow
     ), null);
-    const capexRaw = toNum(choose(
-      c.capitalExpenditure,
-      c.capex
+
+    const capexRaw = toNum(alphaChoose(
+      c.capitalExpenditures,
+      c.capitalExpenditure
     ), null);
-    const capex = capexRaw === null ? null : safeAbsCapex(capexRaw);
+
+    const capex = capexRaw === null ? null : Math.abs(capexRaw);
     const fcff = (cfo !== null && capex !== null) ? (cfo - capex) : null;
 
-    const cash = toNum(choose(
-      b.cashAndCashEquivalents,
+    const cash = toNum(alphaChoose(
       b.cashAndCashEquivalentsAtCarryingValue,
-      b.cashAndShortTermInvestments
+      b.cashAndShortTermInvestments,
+      b.cashAndCashEquivalents
     ), null);
 
-    const debt = toNum(choose(
-      b.totalDebt,
-      b.shortTermDebt,
-      b.longTermDebt
+    const debt = toNum(alphaChoose(
+      b.shortLongTermDebtTotal,
+      b.longTermDebtNoncurrent,
+      b.currentDebtAndCapitalLeaseObligation
     ), null);
 
-    const dilutedShares = toNum(choose(
-      i.weightedAverageShsOutDil,
-      i.weightedAverageShsOut,
-      i.weightedAverageSharesDiluted
-    ), null);
+    const netCash = (cash !== null && debt !== null) ? (cash - debt) : null;
 
     const grossMargin = revenue !== null && grossProfit !== null && revenue !== 0 ? grossProfit / revenue : null;
     const ebitMargin = revenue !== null && ebit !== null && revenue !== 0 ? ebit / revenue : null;
     const fcfMargin = revenue !== null && fcff !== null && revenue !== 0 ? fcff / revenue : null;
 
-    const netCash = (cash !== null && debt !== null) ? (cash - debt) : null;
-
-    const fiscalYear = toNum(choose(i.calendarYear, b.calendarYear, c.calendarYear, key?.slice?.(0, 4)), null);
-    const periodLabel = choose(i.period, b.period, c.period, periodType === "annual" ? `FY${fiscalYear}` : null);
-    const filingDate = choose(i.fillingDate, b.fillingDate, c.fillingDate, null);
+    const fiscalYear = toNum((key || "").slice(0, 4), null);
 
     return {
       fiscal_period: periodType === "annual"
         ? `FY${fiscalYear ?? ""}`
-        : choose(periodLabel, key),
+        : alphaChoose(i.fiscalDateEnding, key),
       fiscal_year: fiscalYear,
       period_type: periodType,
-      period_end: key || null,
-      filing_date: filingDate,
+      period_end: key,
+      filing_date: null,
       revenue,
       gross_profit: grossProfit,
       ebit,
@@ -405,82 +420,82 @@ function buildUnifiedPeriods(incomeRows, balanceRows, cashRows, periodType) {
       gross_margin: grossMargin,
       ebit_margin: ebitMargin,
       fcf_margin: fcfMargin,
-      roe: toNum(choose(i.roe, b.roe), null),
-      roic: toNum(choose(i.roic, b.roic), null)
+      roe: null,
+      roic: null
     };
   });
 }
 
-function buildUnifiedTTM(incomeTtmRaw, balanceTtmRaw, cashTtmRaw) {
-  const i = firstObject(incomeTtmRaw) || {};
-  const b = firstObject(balanceTtmRaw) || {};
-  const c = firstObject(cashTtmRaw) || {};
+function buildAlphaTTM(incomeQuarterly, balanceQuarterly, cashQuarterly, sharesQuarterly) {
+  const iq = [...incomeQuarterly].slice(0, 4);
+  const cq = [...cashQuarterly].slice(0, 4);
+  const b0 = balanceQuarterly[0] || {};
+  const sq = sharesQuarterly[0] || {};
 
-  const revenue = toNum(choose(i.revenue), null);
-  const ebit = toNum(choose(i.operatingIncome, i.ebit), null);
-  const netIncome = toNum(choose(i.netIncome), null);
-  const epsGaap = toNum(choose(i.eps, i.epsdiluted, i.epsDiluted), null);
-  const epsNonGaap = toNum(choose(i.epsdiluted, i.epsDiluted, i.eps), null);
-  const cfo = toNum(choose(
-    c.netCashProvidedByOperatingActivities,
-    c.operatingCashFlow,
-    c.cashFlowFromOperations
+  const sum = (rows, fieldNames) => {
+    const vals = rows.map((r) => toNum(alphaChoose(...fieldNames.map((f) => r[f])), null)).filter((v) => v !== null);
+    return vals.length > 0 ? vals.reduce((a, b) => a + b, 0) : null;
+  };
+
+  const revenue = sum(iq, ["totalRevenue", "revenue"]);
+  const grossProfit = sum(iq, ["grossProfit"]);
+  const ebit = sum(iq, ["operatingIncome", "ebit"]);
+  const ebitda = sum(iq, ["ebitda", "EBITDA"]);
+  const netIncome = sum(iq, ["netIncome"]);
+  const cfo = sum(cq, ["operatingCashflow", "operatingCashFlow"]);
+  const capexAbs = (() => {
+    const vals = cq
+      .map((r) => toNum(alphaChoose(r.capitalExpenditures, r.capitalExpenditure), null))
+      .filter((v) => v !== null)
+      .map((v) => Math.abs(v));
+    return vals.length > 0 ? vals.reduce((a, b) => a + b, 0) : null;
+  })();
+
+  const fcff = (cfo !== null && capexAbs !== null) ? (cfo - capexAbs) : null;
+
+  const cash = toNum(alphaChoose(
+    b0.cashAndCashEquivalentsAtCarryingValue,
+    b0.cashAndShortTermInvestments,
+    b0.cashAndCashEquivalents
   ), null);
-  const capexRaw = toNum(choose(c.capitalExpenditure, c.capex), null);
-  const capex = capexRaw === null ? null : safeAbsCapex(capexRaw);
-  const fcff = (cfo !== null && capex !== null) ? (cfo - capex) : null;
+
+  const debt = toNum(alphaChoose(
+    b0.shortLongTermDebtTotal,
+    b0.longTermDebtNoncurrent,
+    b0.currentDebtAndCapitalLeaseObligation
+  ), null);
+
+  const dilutedShares = toNum(alphaChoose(
+    sq.dilutedSharesOutstanding,
+    sq.sharesOutstanding,
+    sq.commonSharesOutstanding
+  ), null);
 
   return {
     fiscal_period: "TTM",
     fiscal_year: null,
     period_type: "ttm",
-    period_end: choose(i.date, b.date, c.date, null),
-    filing_date: choose(i.fillingDate, b.fillingDate, c.fillingDate, null),
+    period_end: alphaChoose(iq[0]?.fiscalDateEnding, cq[0]?.fiscalDateEnding, b0?.fiscalDateEnding, null),
+    filing_date: null,
     revenue,
-    gross_profit: toNum(choose(i.grossProfit), null),
+    gross_profit: grossProfit,
     ebit,
-    ebitda: toNum(choose(i.ebitda), null),
+    ebitda,
     net_income: netIncome,
-    eps_gaap: epsGaap,
-    eps_nongaap: epsNonGaap,
+    eps_gaap: dilutedShares && dilutedShares !== 0 && netIncome !== null ? netIncome / dilutedShares : null,
+    eps_nongaap: dilutedShares && dilutedShares !== 0 && netIncome !== null ? netIncome / dilutedShares : null,
     cfo,
-    capex,
+    capex: capexAbs,
     fcff,
-    cash: toNum(choose(
-      b.cashAndCashEquivalents,
-      b.cashAndCashEquivalentsAtCarryingValue,
-      b.cashAndShortTermInvestments
-    ), null),
-    debt: toNum(choose(
-      b.totalDebt,
-      b.shortTermDebt,
-      b.longTermDebt
-    ), null),
-    net_cash: (() => {
-      const cash = toNum(choose(
-        b.cashAndCashEquivalents,
-        b.cashAndCashEquivalentsAtCarryingValue,
-        b.cashAndShortTermInvestments
-      ), null);
-      const debt = toNum(choose(
-        b.totalDebt,
-        b.shortTermDebt,
-        b.longTermDebt
-      ), null);
-      return (cash !== null && debt !== null) ? (cash - debt) : null;
-    })(),
-    diluted_shares: toNum(choose(
-      i.weightedAverageShsOutDil,
-      i.weightedAverageShsOut,
-      i.weightedAverageSharesDiluted
-    ), null),
-    gross_margin: revenue !== null && toNum(choose(i.grossProfit), null) !== null && revenue !== 0
-      ? toNum(choose(i.grossProfit), null) / revenue
-      : null,
+    cash,
+    debt,
+    net_cash: (cash !== null && debt !== null) ? (cash - debt) : null,
+    diluted_shares: dilutedShares,
+    gross_margin: revenue !== null && grossProfit !== null && revenue !== 0 ? grossProfit / revenue : null,
     ebit_margin: revenue !== null && ebit !== null && revenue !== 0 ? ebit / revenue : null,
     fcf_margin: revenue !== null && fcff !== null && revenue !== 0 ? fcff / revenue : null,
-    roe: toNum(choose(i.roe, b.roe), null),
-    roic: toNum(choose(i.roic, b.roic), null)
+    roe: null,
+    roic: null
   };
 }
 
@@ -594,7 +609,7 @@ app.post("/v1/market-price-pack", async (req, res) => {
   let marketstackOHLCV = [];
 
   try {
-    const [quote, profile] = await Promise.all([
+    const [quote] = await Promise.all([
       finnhubGet("/quote", { symbol }),
       finnhubGet("/stock/profile2", { symbol })
     ]);
@@ -781,44 +796,63 @@ app.post("/v1/fundamental-actuals-pack", async (req, res) => {
   const warnings = [];
 
   try {
-    const [
-      incomeAnnual,
-      balanceAnnual,
-      cashAnnual,
-      incomeQuarter,
-      balanceQuarter,
-      cashQuarter,
-      incomeTtm,
-      balanceTtm,
-      cashTtm
-    ] = await Promise.all([
-      fmpStableGet("income-statement", { symbol, limit: annualYears, period: "annual" }),
-      fmpStableGet("balance-sheet-statement", { symbol, limit: annualYears, period: "annual" }),
-      fmpStableGet("cash-flow-statement", { symbol, limit: annualYears, period: "annual" }),
-      fmpStableGet("income-statement", { symbol, limit: quarterlyPeriods, period: "quarter" }),
-      fmpStableGet("balance-sheet-statement", { symbol, limit: quarterlyPeriods, period: "quarter" }),
-      fmpStableGet("cash-flow-statement", { symbol, limit: quarterlyPeriods, period: "quarter" }),
-      includeTtm ? fmpStableGet("income-statement-ttm", { symbol }) : Promise.resolve(null),
-      includeTtm ? fmpStableGet("balance-sheet-statement-ttm", { symbol }) : Promise.resolve(null),
-      includeTtm ? fmpStableGet("cash-flow-statement-ttm", { symbol }) : Promise.resolve(null)
+    const [incomeRaw, balanceRaw, cashRaw, sharesRaw] = await Promise.all([
+      alphaGet({ function: "INCOME_STATEMENT", symbol }),
+      alphaGet({ function: "BALANCE_SHEET", symbol }),
+      alphaGet({ function: "CASH_FLOW", symbol }),
+      alphaGet({ function: "SHARES_OUTSTANDING", symbol })
     ]);
 
-    const annuals = buildUnifiedPeriods(
-      firstArrayOrEmpty(incomeAnnual).slice(0, annualYears),
-      firstArrayOrEmpty(balanceAnnual).slice(0, annualYears),
-      firstArrayOrEmpty(cashAnnual).slice(0, annualYears),
+    if (
+      alphaHasRateLimitOrError(incomeRaw) ||
+      alphaHasRateLimitOrError(balanceRaw) ||
+      alphaHasRateLimitOrError(cashRaw) ||
+      alphaHasRateLimitOrError(sharesRaw)
+    ) {
+      const note =
+        incomeRaw?.Note || incomeRaw?.Information || incomeRaw?.["Error Message"] ||
+        balanceRaw?.Note || balanceRaw?.Information || balanceRaw?.["Error Message"] ||
+        cashRaw?.Note || cashRaw?.Information || cashRaw?.["Error Message"] ||
+        sharesRaw?.Note || sharesRaw?.Information || sharesRaw?.["Error Message"] ||
+        "alpha returned note/error payload";
+      sourceStatus.push({ provider: "alpha_vantage", status: "partial", note });
+      return res.status(502).json(fail(
+        "UPSTREAM_PARTIAL_DATA",
+        "Alpha Vantage returned a note/error payload instead of usable fundamental actuals.",
+        502,
+        sourceStatus,
+        warnings
+      ));
+    }
+
+    const income = normalizeAlphaReports(incomeRaw);
+    const balance = normalizeAlphaReports(balanceRaw);
+    const cash = normalizeAlphaReports(cashRaw);
+    const shares = normalizeAlphaShares(sharesRaw);
+
+    const annuals = buildAlphaUnifiedPeriods(
+      income.annual.slice(0, annualYears),
+      balance.annual.slice(0, annualYears),
+      cash.annual.slice(0, annualYears),
+      shares.annual.slice(0, annualYears),
       "annual"
     );
 
-    const quarterlies = buildUnifiedPeriods(
-      firstArrayOrEmpty(incomeQuarter).slice(0, quarterlyPeriods),
-      firstArrayOrEmpty(balanceQuarter).slice(0, quarterlyPeriods),
-      firstArrayOrEmpty(cashQuarter).slice(0, quarterlyPeriods),
+    const quarterlies = buildAlphaUnifiedPeriods(
+      income.quarterly.slice(0, quarterlyPeriods),
+      balance.quarterly.slice(0, quarterlyPeriods),
+      cash.quarterly.slice(0, quarterlyPeriods),
+      shares.quarterly.slice(0, quarterlyPeriods),
       "quarterly"
     );
 
     const ttm = includeTtm
-      ? buildUnifiedTTM(incomeTtm, balanceTtm, cashTtm)
+      ? buildAlphaTTM(
+          income.quarterly.slice(0, 4),
+          balance.quarterly.slice(0, 1),
+          cash.quarterly.slice(0, 4),
+          shares.quarterly.slice(0, 1)
+        )
       : {
           fiscal_period: "TTM",
           fiscal_year: null,
@@ -846,7 +880,7 @@ app.post("/v1/fundamental-actuals-pack", async (req, res) => {
           roic: null
         };
 
-    sourceStatus.push({ provider: "fmp", status: "ok", note: "fmp stable financial statements loaded" });
+    sourceStatus.push({ provider: "alpha_vantage", status: "ok", note: "alpha income/balance/cashflow/shares loaded" });
 
     return res.json(success({
       annuals,
@@ -854,10 +888,10 @@ app.post("/v1/fundamental-actuals-pack", async (req, res) => {
       ttm
     }, sourceStatus, warnings));
   } catch (e) {
-    sourceStatus.push({ provider: "fmp", status: "partial", note: `fmp stable financial statements unavailable: ${e.message}` });
+    sourceStatus.push({ provider: "alpha_vantage", status: "partial", note: `alpha fundamental actuals unavailable: ${e.message}` });
     return res.status(502).json(fail(
       "ALL_PROVIDERS_UNAVAILABLE",
-      "Unable to assemble usable fundamental actuals from FMP stable endpoints.",
+      "Unable to assemble usable fundamental actuals from Alpha Vantage endpoints.",
       502,
       sourceStatus,
       warnings
