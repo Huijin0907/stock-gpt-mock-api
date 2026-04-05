@@ -7,6 +7,7 @@ app.use(express.json());
 const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY || "";
 const ALPHAVANTAGE_API_KEY = process.env.ALPHAVANTAGE_API_KEY || "";
 const FMP_API_KEY = process.env.FMP_API_KEY || "";
+const MARKETSTACK_ACCESS_KEY = process.env.MARKETSTACK_ACCESS_KEY || "";
 
 const success = (data, sourceStatus = [], warnings = []) => ({
   meta: {
@@ -90,6 +91,15 @@ async function fmpStableGet(path, params = {}) {
   if (!FMP_API_KEY) throw new Error("FMP_API_KEY missing");
   const resp = await axios.get(`https://financialmodelingprep.com/stable/${path}`, {
     params: { ...params, apikey: FMP_API_KEY },
+    timeout: 15000
+  });
+  return resp.data;
+}
+
+async function marketstackGet(path = "eod", params = {}) {
+  if (!MARKETSTACK_ACCESS_KEY) throw new Error("MARKETSTACK_ACCESS_KEY missing");
+  const resp = await axios.get(`https://api.marketstack.com/v1/${path}`, {
+    params: { ...params, access_key: MARKETSTACK_ACCESS_KEY },
     timeout: 15000
   });
   return resp.data;
@@ -238,6 +248,38 @@ function buildFmpOHLCV(payload, maxPoints = 252) {
     .sort((a, b) => a.ts.localeCompare(b.ts));
 }
 
+function buildMarketstackOHLCV(payload, maxPoints = 252) {
+  const rows = Array.isArray(payload?.data) ? payload.data : [];
+
+  return rows
+    .slice(0, maxPoints)
+    .map((r) => ({
+      ts: r.date ? new Date(r.date).toISOString() : null,
+      open: toNum(r.open, null),
+      high: toNum(r.high, null),
+      low: toNum(r.low, null),
+      close: toNum(r.close, null),
+      volume: toNum(r.volume, null)
+    }))
+    .filter(
+      (x) =>
+        x.ts &&
+        x.open !== null &&
+        x.high !== null &&
+        x.low !== null &&
+        x.close !== null &&
+        x.volume !== null
+    )
+    .sort((a, b) => a.ts.localeCompare(b.ts));
+}
+
+function formatDateYYYYMMDD(dateObj) {
+  const y = dateObj.getUTCFullYear();
+  const m = String(dateObj.getUTCMonth() + 1).padStart(2, "0");
+  const d = String(dateObj.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
 app.post("/v1/classify-instrument", (req, res) => {
   const symbol = (req.body.symbol || "").toUpperCase().trim();
   if (!symbol) {
@@ -346,6 +388,7 @@ app.post("/v1/market-price-pack", async (req, res) => {
   let finnhubOHLCV = [];
   let fmpProfile = null;
   let fmpOHLCV = [];
+  let marketstackOHLCV = [];
 
   // 1) Finnhub quote/profile as primary snapshot
   try {
@@ -416,7 +459,35 @@ app.post("/v1/market-price-pack", async (req, res) => {
     sourceStatus.push({ provider: "fmp", status: "partial", note: `fmp stable fallback unavailable: ${e.message}` });
   }
 
-  // 4) choose best available price snapshot
+  // 4) Marketstack historical EOD as second history fallback
+  try {
+    if (!MARKETSTACK_ACCESS_KEY) {
+      throw new Error("MARKETSTACK_ACCESS_KEY missing");
+    }
+
+    const toDate = new Date();
+    const fromDate = new Date();
+    fromDate.setUTCDate(fromDate.getUTCDate() - historyYears * 365);
+
+    const msData = await marketstackGet("eod", {
+      symbols: symbol,
+      date_from: formatDateYYYYMMDD(fromDate),
+      date_to: formatDateYYYYMMDD(toDate),
+      limit: Math.min(1000, 260 * historyYears)
+    });
+
+    marketstackOHLCV = buildMarketstackOHLCV(msData, Math.min(252 * historyYears, 2520));
+
+    if (marketstackOHLCV.length > 0) {
+      sourceStatus.push({ provider: "marketstack", status: "ok", note: "marketstack eod history loaded" });
+    } else {
+      sourceStatus.push({ provider: "marketstack", status: "partial", note: "marketstack eod history empty" });
+    }
+  } catch (e) {
+    sourceStatus.push({ provider: "marketstack", status: "partial", note: `marketstack fallback unavailable: ${e.message}` });
+  }
+
+  // 5) choose best available price snapshot
   let priceCurrent = toNum(finnhubQuote?.c, null);
   if (priceCurrent === null && fmpProfile) {
     priceCurrent = toNum(fmpProfile.price, null);
@@ -425,12 +496,22 @@ app.post("/v1/market-price-pack", async (req, res) => {
     }
   }
 
-  // 5) choose best available ohlcv
-  let ohlcv = finnhubOHLCV.length > 0 ? finnhubOHLCV : fmpOHLCV;
+  // 6) choose best available OHLCV
+  let ohlcv = [];
+  if (finnhubOHLCV.length > 0) {
+    ohlcv = finnhubOHLCV;
+  } else if (fmpOHLCV.length > 0) {
+    ohlcv = fmpOHLCV;
+  } else if (marketstackOHLCV.length > 0) {
+    ohlcv = marketstackOHLCV;
+    warnings.push("Using Marketstack EOD fallback for OHLCV.");
+  }
+
+  // 7) Alpha final fallback only if still empty
   if (ohlcv.length === 0 && ALPHAVANTAGE_API_KEY) {
     try {
       const dailyRaw = await alphaGet({
-        function: "TIME_SERIES_DAILY",
+        function: "TIME_SERIES_DAILY_ADJUSTED",
         symbol,
         outputsize: "compact"
       });
@@ -443,7 +524,10 @@ app.post("/v1/market-price-pack", async (req, res) => {
           "alpha returned note/error payload";
         sourceStatus.push({ provider: "alpha_vantage", status: "partial", note });
       } else {
-        const alphaOHLCV = buildAlphaOHLCV(dailyRaw?.["Time Series (Daily)"], 120);
+        const alphaOHLCV = buildAlphaOHLCV(
+          dailyRaw?.["Time Series (Daily)"] || dailyRaw?.["Time Series (Daily Adjusted)"],
+          120
+        );
         if (alphaOHLCV.length > 0) {
           ohlcv = alphaOHLCV;
           sourceStatus.push({ provider: "alpha_vantage", status: "ok", note: "alpha daily fallback loaded" });
@@ -460,7 +544,7 @@ app.post("/v1/market-price-pack", async (req, res) => {
   if (priceCurrent === null || ohlcv.length === 0) {
     return res.status(502).json(fail(
       "ALL_PROVIDERS_UNAVAILABLE",
-      "Unable to assemble a usable market price pack from Finnhub/FMP/Alpha.",
+      "Unable to assemble a usable market price pack from Finnhub/FMP/Marketstack/Alpha.",
       502,
       sourceStatus,
       warnings
