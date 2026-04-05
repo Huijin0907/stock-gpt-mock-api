@@ -239,14 +239,14 @@ app.post("/v1/security-master", async (req, res) => {
       sourceStatus.push({ provider: "fmp", status: "partial", note: "fmp api key missing" });
     }
   } catch (e) {
-    sourceStatus.push({ provider: "fmp", status: "partial", note: "fmp profile unavailable" });
+    sourceStatus.push({ provider: "fmp", status: "partial", note: `fmp profile unavailable: ${e.message}` });
   }
 
   try {
     const profile = await finnhubGet("/stock/profile2", { symbol });
 
     if (!profile || !profile.name) {
-      throw new Error("Finnhub profile empty");
+      throw new Error("finnhub profile empty");
     }
 
     sourceStatus.unshift({ provider: "finnhub", status: "ok", note: "primary profile loaded" });
@@ -257,7 +257,7 @@ app.post("/v1/security-master", async (req, res) => {
       warnings
     ));
   } catch (e) {
-    sourceStatus.unshift({ provider: "finnhub", status: "partial", note: "primary profile unavailable" });
+    sourceStatus.unshift({ provider: "finnhub", status: "partial", note: `primary profile unavailable: ${e.message}` });
   }
 
   if (fmpProfile) {
@@ -316,7 +316,7 @@ app.post("/v1/market-price-pack", async (req, res) => {
       sourceStatus.push({ provider: "fmp", status: "partial", note: "fmp api key missing" });
     }
   } catch (e) {
-    sourceStatus.push({ provider: "fmp", status: "partial", note: "fmp profile unavailable" });
+    sourceStatus.push({ provider: "fmp", status: "partial", note: `fmp profile unavailable: ${e.message}` });
   }
 
   try {
@@ -334,8 +334,15 @@ app.post("/v1/market-price-pack", async (req, res) => {
     const priceCurrent = toNum(quote?.c, null);
     const ohlcv = buildFinnhubOHLCV(candles);
 
+    const finnhubFailureReasons = [];
+    if (priceCurrent === null) finnhubFailureReasons.push("quote missing c");
+    if (!candles) finnhubFailureReasons.push("candles payload missing");
+    if (candles && candles.s !== "ok") finnhubFailureReasons.push(`candles status ${String(candles.s)}`);
+    if (candles && Array.isArray(candles.t) && candles.t.length === 0) finnhubFailureReasons.push("candles empty");
+    if (ohlcv.length === 0) finnhubFailureReasons.push("ohlcv normalized empty");
+
     if (priceCurrent === null || ohlcv.length === 0) {
-      throw new Error("Finnhub market pack incomplete");
+      throw new Error(finnhubFailureReasons.join("; ") || "finnhub market pack incomplete");
     }
 
     const sharesOutstanding =
@@ -367,7 +374,11 @@ app.post("/v1/market-price-pack", async (req, res) => {
       ohlcv
     }, sourceStatus, warnings));
   } catch (e) {
-    sourceStatus.unshift({ provider: "finnhub", status: "partial", note: "primary market pack unavailable" });
+    sourceStatus.unshift({
+      provider: "finnhub",
+      status: "partial",
+      note: `primary market pack unavailable: ${e.message}`
+    });
     warnings.push("Finnhub market pack unavailable, attempting Alpha fallback.");
   }
 
@@ -390,7 +401,9 @@ app.post("/v1/market-price-pack", async (req, res) => {
         dailyRaw?.Information ||
         dailyRaw?.["Error Message"] ||
         "alpha returned note/error payload";
+
       sourceStatus.push({ provider: "alpha_vantage", status: "partial", note });
+
       return res.status(502).json(fail(
         "UPSTREAM_PARTIAL_DATA",
         "Alpha Vantage returned a note/error payload instead of usable market data.",
@@ -403,8 +416,17 @@ app.post("/v1/market-price-pack", async (req, res) => {
     const quote = alphaExtractGlobalQuote(quoteRaw);
     const ohlcv = buildAlphaOHLCV(dailyRaw?.["Time Series (Daily)"], 120);
 
-    if (!quote || (quote.c === null && quote.pc === null) || ohlcv.length === 0) {
-      sourceStatus.push({ provider: "alpha_vantage", status: "partial", note: "alpha payload missing usable quote/daily fields" });
+    const alphaReasons = [];
+    if (!quote) alphaReasons.push("global quote missing usable fields");
+    if (ohlcv.length === 0) alphaReasons.push("daily series empty");
+
+    if (!quote || ohlcv.length === 0) {
+      sourceStatus.push({
+        provider: "alpha_vantage",
+        status: "partial",
+        note: alphaReasons.join("; ") || "alpha payload missing usable quote/daily fields"
+      });
+
       return res.status(502).json(fail(
         "UPSTREAM_PARTIAL_DATA",
         "Alpha Vantage response did not contain usable quote/time-series data.",
@@ -442,7 +464,11 @@ app.post("/v1/market-price-pack", async (req, res) => {
     }, sourceStatus, warnings));
   } catch (e) {
     if (!sourceStatus.some((s) => s.provider === "alpha_vantage")) {
-      sourceStatus.push({ provider: "alpha_vantage", status: "partial", note: "alpha fallback unavailable" });
+      sourceStatus.push({
+        provider: "alpha_vantage",
+        status: "partial",
+        note: `alpha fallback unavailable: ${e.message}`
+      });
     }
   }
 
@@ -454,10 +480,6 @@ app.post("/v1/market-price-pack", async (req, res) => {
     warnings
   ));
 });
-
-/*
-  Remaining endpoints stay mock in this step.
-*/
 
 app.post("/v1/fundamental-actuals-pack", (req, res) => {
   const symbol = (req.body.symbol || "").toUpperCase().trim();
@@ -633,16 +655,7 @@ app.get("/", (req, res) => {
       "/v1/macro-breadth-liquidity-pack",
       "/v1/filings-transcripts-pack",
       "/v1/technical-structure-pack"
-    ],
-    live_phase: {
-      security_master: true,
-      market_price_pack: true,
-      fundamental_actuals_pack: false,
-      estimates_targets_pack: false,
-      macro_breadth_liquidity_pack: false,
-      filings_transcripts_pack: false,
-      technical_structure_pack: false
-    }
+    ]
   });
 });
 
