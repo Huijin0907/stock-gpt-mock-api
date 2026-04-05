@@ -43,7 +43,8 @@ const knownFiscalYearEnd = {
   MSFT: "06-30",
   BABA: "03-31",
   QQQ: "12-31",
-  GLD: "12-31"
+  GLD: "12-31",
+  AAPL: "09-30"
 };
 
 const classifyLocal = (symbol) => {
@@ -116,44 +117,83 @@ function mapFinnhubProfileToSecurityMaster(symbol, profile, fmpProfile = null) {
 }
 
 function buildFinnhubOHLCV(candles) {
-  if (!candles || candles.s !== "ok" || !Array.isArray(candles.t)) return [];
+  if (!candles || candles.s !== "ok" || !Array.isArray(candles.t) || candles.t.length === 0) {
+    return [];
+  }
+
   const out = [];
   for (let i = 0; i < candles.t.length; i++) {
     out.push({
       ts: new Date(candles.t[i] * 1000).toISOString(),
-      open: toNum(candles.o?.[i], 0),
-      high: toNum(candles.h?.[i], 0),
-      low: toNum(candles.l?.[i], 0),
-      close: toNum(candles.c?.[i], 0),
-      volume: toNum(candles.v?.[i], 0)
+      open: toNum(candles.o?.[i], null),
+      high: toNum(candles.h?.[i], null),
+      low: toNum(candles.l?.[i], null),
+      close: toNum(candles.c?.[i], null),
+      volume: toNum(candles.v?.[i], null)
     });
   }
-  return out;
+
+  return out.filter(
+    (x) =>
+      x.ts &&
+      x.open !== null &&
+      x.high !== null &&
+      x.low !== null &&
+      x.close !== null &&
+      x.volume !== null
+  );
+}
+
+function alphaHasRateLimitOrError(payload) {
+  return !!(
+    payload?.Note ||
+    payload?.Information ||
+    payload?.["Error Message"]
+  );
+}
+
+function alphaExtractGlobalQuote(payload) {
+  const q = payload?.["Global Quote"];
+  if (!q || typeof q !== "object" || Object.keys(q).length === 0) return null;
+
+  const price = toNum(q["05. price"], null);
+  const prevClose = toNum(q["08. previous close"], null);
+
+  if (price === null && prevClose === null) return null;
+
+  return {
+    c: price,
+    pc: prevClose,
+    h: toNum(q["03. high"], null),
+    l: toNum(q["04. low"], null),
+    o: toNum(q["02. open"], null)
+  };
 }
 
 function buildAlphaOHLCV(alphaSeries, maxPoints = 120) {
-  if (!alphaSeries || typeof alphaSeries !== "object") return [];
-  const dates = Object.keys(alphaSeries).sort().slice(-maxPoints);
-  return dates.map((d) => ({
-    ts: new Date(`${d}T00:00:00Z`).toISOString(),
-    open: toNum(alphaSeries[d]["1. open"], 0),
-    high: toNum(alphaSeries[d]["2. high"], 0),
-    low: toNum(alphaSeries[d]["3. low"], 0),
-    close: toNum(alphaSeries[d]["4. close"], 0),
-    volume: toNum(alphaSeries[d]["5. volume"], 0)
-  }));
-}
+  if (!alphaSeries || typeof alphaSeries !== "object" || Object.keys(alphaSeries).length === 0) {
+    return [];
+  }
 
-function mapAlphaQuote(alphaQuoteRaw) {
-  const q = alphaQuoteRaw?.["Global Quote"] || {};
-  return {
-    c: toNum(q["05. price"], null),
-    h: toNum(q["03. high"], null),
-    l: toNum(q["04. low"], null),
-    o: toNum(q["02. open"], null),
-    pc: toNum(q["08. previous close"], null),
-    t: Math.floor(Date.now() / 1000)
-  };
+  const dates = Object.keys(alphaSeries).sort().slice(-maxPoints);
+  return dates
+    .map((d) => ({
+      ts: new Date(`${d}T00:00:00Z`).toISOString(),
+      open: toNum(alphaSeries[d]["1. open"], null),
+      high: toNum(alphaSeries[d]["2. high"], null),
+      low: toNum(alphaSeries[d]["3. low"], null),
+      close: toNum(alphaSeries[d]["4. close"], null),
+      volume: toNum(alphaSeries[d]["5. volume"], null)
+    }))
+    .filter(
+      (x) =>
+        x.ts &&
+        x.open !== null &&
+        x.high !== null &&
+        x.low !== null &&
+        x.close !== null &&
+        x.volume !== null
+    );
 }
 
 app.post("/v1/classify-instrument", (req, res) => {
@@ -191,8 +231,12 @@ app.post("/v1/security-master", async (req, res) => {
       const fmpData = await fmpGet(`/api/v3/profile/${symbol}`);
       if (Array.isArray(fmpData) && fmpData.length > 0) {
         fmpProfile = fmpData[0];
-        sourceStatus.push({ provider: "fmp", status: "ok", note: "fmp profile fallback/augment loaded" });
+        sourceStatus.push({ provider: "fmp", status: "ok", note: "fmp profile augment loaded" });
+      } else {
+        sourceStatus.push({ provider: "fmp", status: "partial", note: "fmp profile empty" });
       }
+    } else {
+      sourceStatus.push({ provider: "fmp", status: "partial", note: "fmp api key missing" });
     }
   } catch (e) {
     sourceStatus.push({ provider: "fmp", status: "partial", note: "fmp profile unavailable" });
@@ -265,7 +309,11 @@ app.post("/v1/market-price-pack", async (req, res) => {
       if (Array.isArray(fmpData) && fmpData.length > 0) {
         fmpProfile = fmpData[0];
         sourceStatus.push({ provider: "fmp", status: "ok", note: "fmp profile augment loaded" });
+      } else {
+        sourceStatus.push({ provider: "fmp", status: "partial", note: "fmp profile empty" });
       }
+    } else {
+      sourceStatus.push({ provider: "fmp", status: "partial", note: "fmp api key missing" });
     }
   } catch (e) {
     sourceStatus.push({ provider: "fmp", status: "partial", note: "fmp profile unavailable" });
@@ -283,33 +331,35 @@ app.post("/v1/market-price-pack", async (req, res) => {
       })
     ]);
 
-    if (!quote || !isNonEmpty(quote.c)) {
-      throw new Error("Finnhub quote empty");
+    const priceCurrent = toNum(quote?.c, null);
+    const ohlcv = buildFinnhubOHLCV(candles);
+
+    if (priceCurrent === null || ohlcv.length === 0) {
+      throw new Error("Finnhub market pack incomplete");
     }
 
-    const ohlcv = buildFinnhubOHLCV(candles);
     const sharesOutstanding =
       isNonEmpty(fmpProfile?.sharesOutstanding)
-        ? toNum(fmpProfile.sharesOutstanding, 0)
+        ? toNum(fmpProfile.sharesOutstanding, null)
         : isNonEmpty(profile?.shareOutstanding)
-          ? toNum(profile.shareOutstanding, 0) * 1000000
-          : 0;
+          ? toNum(profile.shareOutstanding, null) * 1000000
+          : null;
 
     const marketCap =
       isNonEmpty(fmpProfile?.mktCap)
-        ? toNum(fmpProfile.mktCap, 0)
-        : sharesOutstanding > 0
-          ? sharesOutstanding * toNum(quote.c, 0)
-          : 0;
+        ? toNum(fmpProfile.mktCap, null)
+        : sharesOutstanding !== null
+          ? sharesOutstanding * priceCurrent
+          : null;
 
     const beta =
-      isNonEmpty(fmpProfile?.beta) ? toNum(fmpProfile.beta, 0) : 0;
+      isNonEmpty(fmpProfile?.beta) ? toNum(fmpProfile.beta, null) : null;
 
     sourceStatus.unshift({ provider: "finnhub", status: "ok", note: "primary quote/profile/candles loaded" });
 
     return res.json(success({
-      price_current: toNum(quote.c, 0),
-      price_timestamp: quote.t ? new Date(quote.t * 1000).toISOString() : new Date().toISOString(),
+      price_current: priceCurrent,
+      price_timestamp: quote?.t ? new Date(quote.t * 1000).toISOString() : new Date().toISOString(),
       market_cap_current: marketCap,
       enterprise_value_current: marketCap,
       shares_outstanding_current: sharesOutstanding,
@@ -322,33 +372,67 @@ app.post("/v1/market-price-pack", async (req, res) => {
   }
 
   try {
+    if (!ALPHAVANTAGE_API_KEY) {
+      throw new Error("ALPHAVANTAGE_API_KEY missing");
+    }
+
     const [quoteRaw, dailyRaw] = await Promise.all([
       alphaGet({ function: "GLOBAL_QUOTE", symbol }),
       alphaGet({ function: "TIME_SERIES_DAILY", symbol, outputsize: "compact" })
     ]);
 
-    const quote = mapAlphaQuote(quoteRaw);
+    if (alphaHasRateLimitOrError(quoteRaw) || alphaHasRateLimitOrError(dailyRaw)) {
+      const note =
+        quoteRaw?.Note ||
+        quoteRaw?.Information ||
+        quoteRaw?.["Error Message"] ||
+        dailyRaw?.Note ||
+        dailyRaw?.Information ||
+        dailyRaw?.["Error Message"] ||
+        "alpha returned note/error payload";
+      sourceStatus.push({ provider: "alpha_vantage", status: "partial", note });
+      return res.status(502).json(fail(
+        "UPSTREAM_PARTIAL_DATA",
+        "Alpha Vantage returned a note/error payload instead of usable market data.",
+        502,
+        sourceStatus,
+        warnings
+      ));
+    }
+
+    const quote = alphaExtractGlobalQuote(quoteRaw);
     const ohlcv = buildAlphaOHLCV(dailyRaw?.["Time Series (Daily)"], 120);
+
+    if (!quote || (quote.c === null && quote.pc === null) || ohlcv.length === 0) {
+      sourceStatus.push({ provider: "alpha_vantage", status: "partial", note: "alpha payload missing usable quote/daily fields" });
+      return res.status(502).json(fail(
+        "UPSTREAM_PARTIAL_DATA",
+        "Alpha Vantage response did not contain usable quote/time-series data.",
+        502,
+        sourceStatus,
+        warnings
+      ));
+    }
 
     const sharesOutstanding =
       isNonEmpty(fmpProfile?.sharesOutstanding)
-        ? toNum(fmpProfile.sharesOutstanding, 0)
-        : 0;
+        ? toNum(fmpProfile.sharesOutstanding, null)
+        : null;
 
     const marketCap =
       isNonEmpty(fmpProfile?.mktCap)
-        ? toNum(fmpProfile.mktCap, 0)
-        : sharesOutstanding > 0 && isNonEmpty(quote.c)
-          ? sharesOutstanding * toNum(quote.c, 0)
-          : 0;
+        ? toNum(fmpProfile.mktCap, null)
+        : sharesOutstanding !== null && quote.c !== null
+          ? sharesOutstanding * quote.c
+          : null;
 
     const beta =
-      isNonEmpty(fmpProfile?.beta) ? toNum(fmpProfile.beta, 0) : 0;
+      isNonEmpty(fmpProfile?.beta) ? toNum(fmpProfile.beta, null) : null;
 
     sourceStatus.push({ provider: "alpha_vantage", status: "ok", note: "alpha quote/daily fallback loaded" });
 
     return res.json(success({
-      price_current: toNum(quote.c, 0),
+      price_current: quote.c,
       price_timestamp: new Date().toISOString(),
       market_cap_current: marketCap,
       enterprise_value_current: marketCap,
@@ -357,7 +441,9 @@ app.post("/v1/market-price-pack", async (req, res) => {
       ohlcv
     }, sourceStatus, warnings));
   } catch (e) {
-    sourceStatus.push({ provider: "alpha_vantage", status: "partial", note: "alpha fallback unavailable" });
+    if (!sourceStatus.some((s) => s.provider === "alpha_vantage")) {
+      sourceStatus.push({ provider: "alpha_vantage", status: "partial", note: "alpha fallback unavailable" });
+    }
   }
 
   return res.status(502).json(fail(
@@ -370,12 +456,7 @@ app.post("/v1/market-price-pack", async (req, res) => {
 });
 
 /*
-  The next four endpoints remain mock on purpose in this phase.
-  We are replacing the two lowest-risk, highest-value live data paths first:
-  security-master + market-price-pack.
-  After this is stable, we will live-wire:
-  - fundamental-actuals-pack
-  - estimates-targets-pack
+  Remaining endpoints stay mock in this step.
 */
 
 app.post("/v1/fundamental-actuals-pack", (req, res) => {
@@ -437,62 +518,7 @@ app.post("/v1/estimates-targets-pack", (req, res) => {
     return res.status(400).json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
   }
 
-  const map = {
-    MSFT: {
-      eps_fy0_est: 13.2,
-      eps_fy1_est: 14.4,
-      eps_fy2_est: 15.8,
-      revenue_fy0_est: 276000000000,
-      revenue_fy1_est: 292000000000,
-      revenue_fy2_est: 309000000000,
-      target_price_consensus: 495.0,
-      target_price_low: 430.0,
-      target_price_high: 560.0,
-      analyst_count: 42,
-      estimate_revision_direction: "up"
-    },
-    BABA: {
-      eps_fy0_est: 9.1,
-      eps_fy1_est: 10.0,
-      eps_fy2_est: 11.2,
-      revenue_fy0_est: 980000000000,
-      revenue_fy1_est: 1050000000000,
-      revenue_fy2_est: 1125000000000,
-      target_price_consensus: 108.0,
-      target_price_low: 86.0,
-      target_price_high: 132.0,
-      analyst_count: 31,
-      estimate_revision_direction: "mixed"
-    },
-    QQQ: {
-      eps_fy0_est: null,
-      eps_fy1_est: null,
-      eps_fy2_est: null,
-      revenue_fy0_est: null,
-      revenue_fy1_est: null,
-      revenue_fy2_est: null,
-      target_price_consensus: null,
-      target_price_low: null,
-      target_price_high: null,
-      analyst_count: 0,
-      estimate_revision_direction: "unavailable"
-    },
-    GLD: {
-      eps_fy0_est: null,
-      eps_fy1_est: null,
-      eps_fy2_est: null,
-      revenue_fy0_est: null,
-      revenue_fy1_est: null,
-      revenue_fy2_est: null,
-      target_price_consensus: null,
-      target_price_low: null,
-      target_price_high: null,
-      analyst_count: 0,
-      estimate_revision_direction: "unavailable"
-    }
-  };
-
-  const data = map[symbol] || {
+  return res.json(success({
     eps_fy0_est: 5.0,
     eps_fy1_est: 5.5,
     eps_fy2_est: 6.1,
@@ -504,9 +530,7 @@ app.post("/v1/estimates-targets-pack", (req, res) => {
     target_price_high: 120.0,
     analyst_count: 10,
     estimate_revision_direction: "flat"
-  };
-
-  return res.json(success(data, [
+  }, [
     { provider: "mock", status: "ok", note: "estimates pack still mock in phase 1" }
   ]));
 });
@@ -517,7 +541,7 @@ app.post("/v1/macro-breadth-liquidity-pack", (req, res) => {
     return res.status(400).json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
   }
 
-  const defaultData = {
+  return res.json(success({
     macro_regime: "disinflation_with_stable_growth",
     market_state: "trend_up_but_narrowing_breadth",
     liquidity_state: "neutral_to_tightening",
@@ -532,49 +556,7 @@ app.post("/v1/macro-breadth-liquidity-pack", (req, res) => {
       "Participation above 200DMA is healthy but not expanding",
       "Liquidity backdrop is not fully risk-on"
     ]
-  };
-
-  const map = {
-    MSFT: {
-      ...defaultData,
-      should_enter_valuation: "scenario_only"
-    },
-    BABA: {
-      ...defaultData,
-      usd_context: "firm_usd_is_headwind_for_adr_translation",
-      should_enter_valuation: "direct"
-    },
-    QQQ: {
-      ...defaultData,
-      market_state: "trend_up_with_narrow_leadership",
-      should_enter_valuation: "direct",
-      breadth_notes: [
-        "Nasdaq leadership remains concentrated in large-cap growth",
-        "Equal-weight participation is weaker than cap-weight performance",
-        "Broadening is improving but not yet decisive"
-      ]
-    },
-    GLD: {
-      macro_regime: "real_rate_sensitive_gold_environment",
-      market_state: "range_bound_with_macro_bids",
-      liquidity_state: "neutral",
-      should_enter_valuation: "direct",
-      risk_free_rate: 0.0435,
-      yield_curve_slope: 0.0021,
-      usd_context: "firm_usd_caps_gold_upside",
-      breadth_score: 50.0,
-      breadth_health: "neutral",
-      breadth_notes: [
-        "Gold-related products are more sensitive to real rates and USD than equity breadth",
-        "Risk-off demand exists but is not dominant",
-        "Macro impulse matters more than stock-style participation"
-      ]
-    }
-  };
-
-  const data = map[symbol] || defaultData;
-
-  return res.json(success(data, [
+  }, [
     { provider: "mock", status: "ok", note: "macro pack still mock in phase 1" }
   ]));
 });
