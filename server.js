@@ -37,54 +37,114 @@ const SEC_ANNUAL_FORMS = new Set([
   "40-F/A"
 ]);
 
-const SEC_QUARTERLY_FORMS = new Set([
-  "10-Q",
-  "10-Q/A",
-  "6-K",
-  "6-K/A"
-]);
+const SEC_QUARTERLY_FORMS = new Set(["10-Q", "10-Q/A", "6-K", "6-K/A"]);
+const SEC_TAXONOMY_PRIORITY = ["us-gaap", "ifrs-full", "srt"];
 
 const SEC_METRIC_TAGS = {
-  revenue: [
-    "RevenueFromContractWithCustomerExcludingAssessedTax",
-    "SalesRevenueNet",
-    "Revenues",
-    "RevenueFromContractWithCustomerIncludingAssessedTax"
-  ],
-  gross_profit: ["GrossProfit"],
-  ebit: ["OperatingIncomeLoss"],
-  net_income: ["NetIncomeLoss", "ProfitLoss"],
-  eps_gaap: ["EarningsPerShareDiluted", "EarningsPerShareBasicAndDiluted"],
-  cfo: [
-    "NetCashProvidedByUsedInOperatingActivities",
-    "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"
-  ],
-  capex: [
-    "PaymentsToAcquirePropertyPlantAndEquipment",
-    "PropertyPlantAndEquipmentAdditions"
-  ],
-  cash: [
-    "CashAndCashEquivalentsAtCarryingValue",
-    "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
-    "CashCashEquivalentsAndShortTermInvestments"
-  ],
-  debt_total: [
-    "LongTermDebtAndCapitalLeaseObligations",
-    "LongTermDebtAndCapitalLeaseObligationsIncludingCurrentMaturities",
-    "DebtAndFinanceLeaseObligations",
-    "DebtInstrumentFaceAmount"
-  ],
-  debt_current: [
-    "LongTermDebtCurrent",
-    "LongTermDebtAndCapitalLeaseObligationsCurrent",
-    "ShortTermBorrowings"
-  ],
-  debt_noncurrent: [
-    "LongTermDebtNoncurrent",
-    "LongTermDebtAndCapitalLeaseObligationsNoncurrent"
-  ],
-  diluted_shares_duration: ["WeightedAverageNumberOfDilutedSharesOutstanding"],
-  common_shares_outstanding: ["CommonStockSharesOutstanding"]
+  revenue: {
+    "us-gaap": [
+      "RevenueFromContractWithCustomerExcludingAssessedTax",
+      "SalesRevenueNet",
+      "Revenues",
+      "RevenueFromContractWithCustomerIncludingAssessedTax"
+    ],
+    "ifrs-full": ["Revenue"],
+    srt: []
+  },
+  gross_profit: {
+    "us-gaap": ["GrossProfit"],
+    "ifrs-full": ["GrossProfit"],
+    srt: []
+  },
+  ebit: {
+    "us-gaap": ["OperatingIncomeLoss"],
+    "ifrs-full": ["ProfitLossFromOperatingActivities", "OperatingProfitLoss"],
+    srt: []
+  },
+  net_income: {
+    "us-gaap": ["NetIncomeLoss", "ProfitLoss"],
+    "ifrs-full": ["ProfitLoss"],
+    srt: []
+  },
+  eps_gaap: {
+    "us-gaap": ["EarningsPerShareDiluted", "EarningsPerShareBasicAndDiluted"],
+    "ifrs-full": [
+      "DilutedEarningsLossPerShare",
+      "BasicAndDilutedEarningsLossPerShare"
+    ],
+    srt: []
+  },
+  cfo: {
+    "us-gaap": [
+      "NetCashProvidedByUsedInOperatingActivities",
+      "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"
+    ],
+    "ifrs-full": ["CashFlowsFromUsedInOperatingActivities"],
+    srt: []
+  },
+  capex: {
+    "us-gaap": [
+      "PaymentsToAcquirePropertyPlantAndEquipment",
+      "PropertyPlantAndEquipmentAdditions"
+    ],
+    "ifrs-full": [
+      "PurchaseOfPropertyPlantAndEquipment",
+      "PropertyPlantAndEquipmentAdditions"
+    ],
+    srt: []
+  },
+  cash: {
+    "us-gaap": [
+      "CashAndCashEquivalentsAtCarryingValue",
+      "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+      "CashCashEquivalentsAndShortTermInvestments"
+    ],
+    "ifrs-full": [
+      "CashAndCashEquivalents",
+      "CashAndCashEquivalentsIfDifferentFromStatementOfFinancialPosition"
+    ],
+    srt: []
+  },
+  debt_total: {
+    "us-gaap": [
+      "LongTermDebtAndCapitalLeaseObligations",
+      "LongTermDebtAndCapitalLeaseObligationsIncludingCurrentMaturities",
+      "DebtAndFinanceLeaseObligations",
+      "DebtInstrumentFaceAmount"
+    ],
+    "ifrs-full": ["Borrowings"],
+    srt: []
+  },
+  debt_current: {
+    "us-gaap": [
+      "LongTermDebtCurrent",
+      "LongTermDebtAndCapitalLeaseObligationsCurrent",
+      "ShortTermBorrowings"
+    ],
+    "ifrs-full": ["CurrentBorrowings"],
+    srt: []
+  },
+  debt_noncurrent: {
+    "us-gaap": [
+      "LongTermDebtNoncurrent",
+      "LongTermDebtAndCapitalLeaseObligationsNoncurrent"
+    ],
+    "ifrs-full": ["NoncurrentBorrowings"],
+    srt: []
+  },
+  diluted_shares_duration: {
+    "us-gaap": ["WeightedAverageNumberOfDilutedSharesOutstanding"],
+    "ifrs-full": [
+      "WeightedAverageNumberOfSharesOutstandingDiluted",
+      "WeightedAverageNumberOfOrdinarySharesOutstandingDiluted"
+    ],
+    srt: []
+  },
+  common_shares_outstanding: {
+    "us-gaap": ["CommonStockSharesOutstanding"],
+    "ifrs-full": ["NumberOfSharesOutstanding"],
+    srt: []
+  }
 };
 
 const success = (data, sourceStatus = [], warnings = []) => ({
@@ -620,9 +680,7 @@ function buildAlphaTTM(
 
   const sum = (rows, fieldNames) => {
     const vals = rows
-      .map((r) =>
-        toNum(alphaChoose(...fieldNames.map((f) => r[f])), null)
-      )
+      .map((r) => toNum(alphaChoose(...fieldNames.map((f) => r[f])), null))
       .filter((v) => v !== null);
     return vals.length > 0 ? vals.reduce((a, b) => a + b, 0) : null;
   };
@@ -753,12 +811,7 @@ function setCacheEntry(cacheMap, cacheKey, value, ttlMs) {
   cacheMap.set(cacheKey, { expiresAt: Date.now() + ttlMs, value });
 }
 
-function buildActualsCacheKey(
-  symbol,
-  annualYears,
-  quarterlyPeriods,
-  includeTtm
-) {
+function buildActualsCacheKey(symbol, annualYears, quarterlyPeriods, includeTtm) {
   return `${symbol}__a${annualYears}__q${quarterlyPeriods}__ttm${
     includeTtm ? 1 : 0
   }`;
@@ -818,8 +871,13 @@ function secDurationDaysFromRow(row) {
   return Math.round((e - s) / 86400000);
 }
 
-function secFactRowsByTag(companyFacts, tag, unitsPriority = []) {
-  const unitsObj = companyFacts?.facts?.["us-gaap"]?.[tag]?.units || null;
+function secTaxonomyRank(taxonomy) {
+  const idx = SEC_TAXONOMY_PRIORITY.indexOf(taxonomy);
+  return idx === -1 ? 999 : idx;
+}
+
+function secFactRowsByTag(companyFacts, taxonomy, tag, unitsPriority = []) {
+  const unitsObj = companyFacts?.facts?.[taxonomy]?.[tag]?.units || null;
   if (!unitsObj || typeof unitsObj !== "object") return [];
 
   const selectedUnits =
@@ -831,6 +889,7 @@ function secFactRowsByTag(companyFacts, tag, unitsPriority = []) {
   for (const unit of selectedUnits) {
     for (const row of unitsObj[unit] || []) {
       rows.push({
+        taxonomy,
         tag,
         unit,
         val: toNum(row?.val, null),
@@ -849,6 +908,24 @@ function secFactRowsByTag(companyFacts, tag, unitsPriority = []) {
   return rows.filter((r) => r.val !== null && r.end);
 }
 
+function secGetRowsForMetric(
+  companyFacts,
+  metricKey,
+  unitsPriority = ["USD", "USD/shares", "shares", "pure"]
+) {
+  const metric = SEC_METRIC_TAGS[metricKey] || {};
+  let rows = [];
+
+  for (const taxonomy of SEC_TAXONOMY_PRIORITY) {
+    const tags = Array.isArray(metric[taxonomy]) ? metric[taxonomy] : [];
+    for (const tag of tags) {
+      rows = rows.concat(secFactRowsByTag(companyFacts, taxonomy, tag, unitsPriority));
+    }
+  }
+
+  return rows;
+}
+
 function secIsAnnualRow(row) {
   return (
     row?.fp === "FY" ||
@@ -859,7 +936,14 @@ function secIsAnnualRow(row) {
 
 function secIsSingleQuarterRow(row) {
   if (!row || row.durationDays === null) return false;
-  return row.durationDays >= 70 && row.durationDays <= 110;
+  if (/^Q[1-4]$/.test(String(row.fp || ""))) {
+    return row.durationDays >= 70 && row.durationDays <= 110;
+  }
+  return (
+    row.durationDays >= 70 &&
+    row.durationDays <= 110 &&
+    (SEC_QUARTERLY_FORMS.has(row.form) || !SEC_ANNUAL_FORMS.has(row.form))
+  );
 }
 
 function secIsNineMonthRow(row) {
@@ -869,6 +953,10 @@ function secIsNineMonthRow(row) {
 
 function secSortRowsForPreference(rows = []) {
   return [...rows].sort((a, b) => {
+    const taxonomyDiff =
+      secTaxonomyRank(a.taxonomy) - secTaxonomyRank(b.taxonomy);
+    if (taxonomyDiff !== 0) return taxonomyDiff;
+
     const filedDiff = secParseDateMs(b.filed) - secParseDateMs(a.filed);
     if (filedDiff !== 0) return filedDiff;
 
@@ -882,21 +970,9 @@ function secSortRowsForPreference(rows = []) {
   });
 }
 
-function secGetRowsForTags(
-  companyFacts,
-  tags,
-  unitsPriority = ["USD", "USD/shares", "shares", "pure"]
-) {
-  let rows = [];
-  for (const tag of tags) {
-    rows = rows.concat(secFactRowsByTag(companyFacts, tag, unitsPriority));
-  }
-  return rows;
-}
-
-function secFindBestInstantValue(companyFacts, tags, periodEnd) {
+function secFindBestInstantValue(companyFacts, metricKey, periodEnd) {
   const candidates = secSortRowsForPreference(
-    secGetRowsForTags(companyFacts, tags, [
+    secGetRowsForMetric(companyFacts, metricKey, [
       "USD",
       "shares",
       "USD/shares",
@@ -906,42 +982,48 @@ function secFindBestInstantValue(companyFacts, tags, periodEnd) {
   return candidates[0]?.val ?? null;
 }
 
-function secFindBestAnnualFlowRow(companyFacts, tags, periodEnd) {
+function secFindBestAnnualFlowRow(companyFacts, metricKey, periodEnd) {
   const candidates = secSortRowsForPreference(
-    secGetRowsForTags(companyFacts, tags, ["USD", "USD/shares", "pure"]).filter(
-      (row) => row.end === periodEnd && secIsAnnualRow(row)
-    )
+    secGetRowsForMetric(companyFacts, metricKey, [
+      "USD",
+      "USD/shares",
+      "pure"
+    ]).filter((row) => row.end === periodEnd && secIsAnnualRow(row))
   );
   return candidates[0] || null;
 }
 
-function secFindBestQuarterFlowRow(companyFacts, tags, periodEnd) {
+function secFindBestQuarterFlowRow(companyFacts, metricKey, periodEnd) {
   const candidates = secSortRowsForPreference(
-    secGetRowsForTags(companyFacts, tags, ["USD", "USD/shares", "pure"]).filter(
-      (row) => row.end === periodEnd && secIsSingleQuarterRow(row)
-    )
+    secGetRowsForMetric(companyFacts, metricKey, [
+      "USD",
+      "USD/shares",
+      "pure"
+    ]).filter((row) => row.end === periodEnd && secIsSingleQuarterRow(row))
   );
   return candidates[0] || null;
 }
 
-function secFindBestNineMonthRow(companyFacts, tags, fiscalYear, annualEnd) {
+function secFindBestNineMonthRow(companyFacts, metricKey, fiscalYear, annualEnd) {
   const candidates = secSortRowsForPreference(
-    secGetRowsForTags(companyFacts, tags, ["USD", "USD/shares", "pure"]).filter(
-      (row) => {
-        if (!secIsNineMonthRow(row)) return false;
-        if (annualEnd && secParseDateMs(row.end) >= secParseDateMs(annualEnd))
-          return false;
-        if (
-          fiscalYear !== null &&
-          fiscalYear !== undefined &&
-          row.fy !== null &&
-          row.fy !== undefined
-        ) {
-          return Number(row.fy) === Number(fiscalYear);
-        }
-        return true;
+    secGetRowsForMetric(companyFacts, metricKey, [
+      "USD",
+      "USD/shares",
+      "pure"
+    ]).filter((row) => {
+      if (!secIsNineMonthRow(row)) return false;
+      if (annualEnd && secParseDateMs(row.end) >= secParseDateMs(annualEnd))
+        return false;
+      if (
+        fiscalYear !== null &&
+        fiscalYear !== undefined &&
+        row.fy !== null &&
+        row.fy !== undefined
+      ) {
+        return Number(row.fy) === Number(fiscalYear);
       }
-    )
+      return true;
+    })
   );
 
   if (candidates.length === 0) return null;
@@ -953,16 +1035,16 @@ function secFindBestNineMonthRow(companyFacts, tags, fiscalYear, annualEnd) {
   return candidates[0];
 }
 
-function secFindQuarterFlowValue(companyFacts, tags, periodEnd) {
-  const directQuarter = secFindBestQuarterFlowRow(companyFacts, tags, periodEnd);
+function secFindQuarterFlowValue(companyFacts, metricKey, periodEnd) {
+  const directQuarter = secFindBestQuarterFlowRow(companyFacts, metricKey, periodEnd);
   if (directQuarter) return directQuarter.val;
 
-  const annualRow = secFindBestAnnualFlowRow(companyFacts, tags, periodEnd);
+  const annualRow = secFindBestAnnualFlowRow(companyFacts, metricKey, periodEnd);
   if (!annualRow) return null;
 
   const nineMonthRow = secFindBestNineMonthRow(
     companyFacts,
-    tags,
+    metricKey,
     annualRow.fy,
     periodEnd
   );
@@ -984,7 +1066,7 @@ function secHasMeaningfulQuarter(period) {
 }
 
 function secCollectAnnualEnds(companyFacts) {
-  const rows = secGetRowsForTags(companyFacts, SEC_METRIC_TAGS.revenue, ["USD"]);
+  const rows = secGetRowsForMetric(companyFacts, "revenue", ["USD"]);
   const ends = new Set();
   for (const row of rows) {
     if (secIsAnnualRow(row)) ends.add(row.end);
@@ -993,22 +1075,17 @@ function secCollectAnnualEnds(companyFacts) {
 }
 
 function secCollectQuarterCandidateEnds(companyFacts) {
-  const directQuarterRows = secGetRowsForTags(
-    companyFacts,
-    SEC_METRIC_TAGS.revenue,
-    ["USD"]
-  ).filter((row) => secIsSingleQuarterRow(row));
-
-  const annualRows = secGetRowsForTags(
-    companyFacts,
-    SEC_METRIC_TAGS.revenue,
-    ["USD"]
-  ).filter((row) => secIsAnnualRow(row));
-
+  const metrics = ["revenue", "net_income", "cfo"];
   const ends = new Set();
 
-  for (const row of directQuarterRows) ends.add(row.end);
-  for (const row of annualRows) ends.add(row.end);
+  for (const metricKey of metrics) {
+    const rows = secGetRowsForMetric(companyFacts, metricKey, ["USD"]);
+    for (const row of rows) {
+      if (secIsSingleQuarterRow(row) || secIsAnnualRow(row)) {
+        ends.add(row.end);
+      }
+    }
+  }
 
   return Array.from(ends).sort().reverse();
 }
@@ -1018,69 +1095,40 @@ function secBuildAnnualPeriods(companyFacts, limit) {
 
   return periodEnds.map((periodEnd) => {
     const revenue =
-      secFindBestAnnualFlowRow(
-        companyFacts,
-        SEC_METRIC_TAGS.revenue,
-        periodEnd
-      )?.val ?? null;
+      secFindBestAnnualFlowRow(companyFacts, "revenue", periodEnd)?.val ?? null;
     const grossProfit =
-      secFindBestAnnualFlowRow(
-        companyFacts,
-        SEC_METRIC_TAGS.gross_profit,
-        periodEnd
-      )?.val ?? null;
+      secFindBestAnnualFlowRow(companyFacts, "gross_profit", periodEnd)?.val ??
+      null;
     const ebit =
-      secFindBestAnnualFlowRow(
-        companyFacts,
-        SEC_METRIC_TAGS.ebit,
-        periodEnd
-      )?.val ?? null;
+      secFindBestAnnualFlowRow(companyFacts, "ebit", periodEnd)?.val ?? null;
     const netIncome =
-      secFindBestAnnualFlowRow(
-        companyFacts,
-        SEC_METRIC_TAGS.net_income,
-        periodEnd
-      )?.val ?? null;
+      secFindBestAnnualFlowRow(companyFacts, "net_income", periodEnd)?.val ??
+      null;
     const epsGaap =
-      secFindBestAnnualFlowRow(
-        companyFacts,
-        SEC_METRIC_TAGS.eps_gaap,
-        periodEnd
-      )?.val ?? null;
+      secFindBestAnnualFlowRow(companyFacts, "eps_gaap", periodEnd)?.val ??
+      null;
     const cfo =
-      secFindBestAnnualFlowRow(
-        companyFacts,
-        SEC_METRIC_TAGS.cfo,
-        periodEnd
-      )?.val ?? null;
+      secFindBestAnnualFlowRow(companyFacts, "cfo", periodEnd)?.val ?? null;
 
     const capexRaw =
-      secFindBestAnnualFlowRow(
-        companyFacts,
-        SEC_METRIC_TAGS.capex,
-        periodEnd
-      )?.val ?? null;
+      secFindBestAnnualFlowRow(companyFacts, "capex", periodEnd)?.val ?? null;
     const capex = capexRaw === null ? null : Math.abs(capexRaw);
     const fcff = cfo !== null && capex !== null ? cfo - capex : null;
 
-    const cash = secFindBestInstantValue(
-      companyFacts,
-      SEC_METRIC_TAGS.cash,
-      periodEnd
-    );
+    const cash = secFindBestInstantValue(companyFacts, "cash", periodEnd);
     const debtTotal = secFindBestInstantValue(
       companyFacts,
-      SEC_METRIC_TAGS.debt_total,
+      "debt_total",
       periodEnd
     );
     const debtCurrent = secFindBestInstantValue(
       companyFacts,
-      SEC_METRIC_TAGS.debt_current,
+      "debt_current",
       periodEnd
     );
     const debtNoncurrent = secFindBestInstantValue(
       companyFacts,
-      SEC_METRIC_TAGS.debt_noncurrent,
+      "debt_noncurrent",
       periodEnd
     );
     const debt =
@@ -1092,26 +1140,18 @@ function secBuildAnnualPeriods(companyFacts, limit) {
     const dilutedShares =
       secFindBestInstantValue(
         companyFacts,
-        SEC_METRIC_TAGS.common_shares_outstanding,
+        "common_shares_outstanding",
         periodEnd
       ) ??
       (secFindBestAnnualFlowRow(
         companyFacts,
-        SEC_METRIC_TAGS.diluted_shares_duration,
+        "diluted_shares_duration",
         periodEnd
       )?.val ?? null);
 
     const annualMeta =
-      secFindBestAnnualFlowRow(
-        companyFacts,
-        SEC_METRIC_TAGS.revenue,
-        periodEnd
-      ) ||
-      secFindBestAnnualFlowRow(
-        companyFacts,
-        SEC_METRIC_TAGS.net_income,
-        periodEnd
-      );
+      secFindBestAnnualFlowRow(companyFacts, "revenue", periodEnd) ||
+      secFindBestAnnualFlowRow(companyFacts, "net_income", periodEnd);
     const fiscalYear = toNum(
       annualMeta?.fy ?? (periodEnd || "").slice(0, 4),
       null
@@ -1160,63 +1200,43 @@ function secBuildQuarterlyPeriods(companyFacts, limit) {
   const out = [];
 
   for (const periodEnd of periodEnds) {
-    const revenue = secFindQuarterFlowValue(
-      companyFacts,
-      SEC_METRIC_TAGS.revenue,
-      periodEnd
-    );
+    const revenue = secFindQuarterFlowValue(companyFacts, "revenue", periodEnd);
     const grossProfit = secFindQuarterFlowValue(
       companyFacts,
-      SEC_METRIC_TAGS.gross_profit,
+      "gross_profit",
       periodEnd
     );
-    const ebit = secFindQuarterFlowValue(
-      companyFacts,
-      SEC_METRIC_TAGS.ebit,
-      periodEnd
-    );
+    const ebit = secFindQuarterFlowValue(companyFacts, "ebit", periodEnd);
     const netIncome = secFindQuarterFlowValue(
       companyFacts,
-      SEC_METRIC_TAGS.net_income,
+      "net_income",
       periodEnd
     );
     const epsGaap = secFindQuarterFlowValue(
       companyFacts,
-      SEC_METRIC_TAGS.eps_gaap,
+      "eps_gaap",
       periodEnd
     );
-    const cfo = secFindQuarterFlowValue(
-      companyFacts,
-      SEC_METRIC_TAGS.cfo,
-      periodEnd
-    );
+    const cfo = secFindQuarterFlowValue(companyFacts, "cfo", periodEnd);
 
-    const capexRaw = secFindQuarterFlowValue(
-      companyFacts,
-      SEC_METRIC_TAGS.capex,
-      periodEnd
-    );
+    const capexRaw = secFindQuarterFlowValue(companyFacts, "capex", periodEnd);
     const capex = capexRaw === null ? null : Math.abs(capexRaw);
     const fcff = cfo !== null && capex !== null ? cfo - capex : null;
 
-    const cash = secFindBestInstantValue(
-      companyFacts,
-      SEC_METRIC_TAGS.cash,
-      periodEnd
-    );
+    const cash = secFindBestInstantValue(companyFacts, "cash", periodEnd);
     const debtTotal = secFindBestInstantValue(
       companyFacts,
-      SEC_METRIC_TAGS.debt_total,
+      "debt_total",
       periodEnd
     );
     const debtCurrent = secFindBestInstantValue(
       companyFacts,
-      SEC_METRIC_TAGS.debt_current,
+      "debt_current",
       periodEnd
     );
     const debtNoncurrent = secFindBestInstantValue(
       companyFacts,
-      SEC_METRIC_TAGS.debt_noncurrent,
+      "debt_noncurrent",
       periodEnd
     );
     const debt =
@@ -1228,36 +1248,20 @@ function secBuildQuarterlyPeriods(companyFacts, limit) {
     const dilutedShares =
       secFindBestInstantValue(
         companyFacts,
-        SEC_METRIC_TAGS.common_shares_outstanding,
+        "common_shares_outstanding",
         periodEnd
       ) ??
       (secFindBestQuarterFlowRow(
         companyFacts,
-        SEC_METRIC_TAGS.diluted_shares_duration,
+        "diluted_shares_duration",
         periodEnd
       )?.val ?? null);
 
     const quarterMeta =
-      secFindBestQuarterFlowRow(
-        companyFacts,
-        SEC_METRIC_TAGS.revenue,
-        periodEnd
-      ) ||
-      secFindBestAnnualFlowRow(
-        companyFacts,
-        SEC_METRIC_TAGS.revenue,
-        periodEnd
-      ) ||
-      secFindBestQuarterFlowRow(
-        companyFacts,
-        SEC_METRIC_TAGS.net_income,
-        periodEnd
-      ) ||
-      secFindBestAnnualFlowRow(
-        companyFacts,
-        SEC_METRIC_TAGS.net_income,
-        periodEnd
-      );
+      secFindBestQuarterFlowRow(companyFacts, "revenue", periodEnd) ||
+      secFindBestAnnualFlowRow(companyFacts, "revenue", periodEnd) ||
+      secFindBestQuarterFlowRow(companyFacts, "net_income", periodEnd) ||
+      secFindBestAnnualFlowRow(companyFacts, "net_income", periodEnd);
 
     const period = {
       fiscal_period: periodEnd,
@@ -1377,6 +1381,56 @@ function secBuildTTMFromQuarterlies(quarterlies) {
     roe: null,
     roic: null
   };
+}
+
+function buildCoverageAssessment(annuals, quarterlies, ttm, instrumentType) {
+  const sourceStatus = [];
+  const warnings = [];
+
+  const ttmCoreFields = [
+    ttm?.revenue,
+    ttm?.ebit,
+    ttm?.net_income,
+    ttm?.cfo,
+    ttm?.eps_gaap
+  ];
+  const ttmCorePresent = ttmCoreFields.filter(
+    (v) => v !== null && v !== undefined
+  ).length;
+
+  if (annuals.length > 0 && quarterlies.length === 0) {
+    sourceStatus.push({
+      provider: "coverage_assessment",
+      status: "partial",
+      note: `annual_only_partial: instrument_type=${instrumentType}, annual fields available but quarterly coverage is insufficient`
+    });
+    warnings.push(
+      "Coverage downgraded to annual_only_partial: annual fields are available, but quarterly and TTM support is insufficient for full valuation work."
+    );
+  } else if (quarterlies.length > 0 && ttmCorePresent < 3) {
+    sourceStatus.push({
+      provider: "coverage_assessment",
+      status: "partial",
+      note: `quarterly_partial: instrument_type=${instrumentType}, quarterly extraction exists but TTM core fields remain sparse`
+    });
+    warnings.push(
+      "Coverage downgraded to quarterly_partial: some quarterly fields were extracted, but TTM remains too sparse for reliable modeling."
+    );
+  } else {
+    sourceStatus.push({
+      provider: "coverage_assessment",
+      status: "ok",
+      note: `coverage appears sufficient for instrument_type=${instrumentType}`
+    });
+  }
+
+  if (instrumentType === "adr_equity") {
+    warnings.push(
+      "ADR/FPI note: foreign issuer filings may use IFRS/SRT/custom taxonomy patterns, so comparability and field completeness can still be weaker than large-cap U.S. GAAP filers."
+    );
+  }
+
+  return { sourceStatus, warnings };
 }
 
 async function fetchAlphaFundamentalActuals(
@@ -1546,7 +1600,8 @@ async function fetchSecFundamentalActuals(
   symbol,
   annualYears,
   quarterlyPeriods,
-  includeTtm
+  includeTtm,
+  instrumentType
 ) {
   const sourceStatus = [];
   const warnings = [];
@@ -1603,9 +1658,7 @@ async function fetchSecFundamentalActuals(
 
   const annuals = secBuildAnnualPeriods(companyFacts, annualYears);
   const quarterlies = secBuildQuarterlyPeriods(companyFacts, quarterlyPeriods);
-  const ttm = includeTtm
-    ? secBuildTTMFromQuarterlies(quarterlies)
-    : buildEmptyTtm();
+  const ttm = includeTtm ? secBuildTTMFromQuarterlies(quarterlies) : buildEmptyTtm();
 
   if (annuals.length === 0 && quarterlies.length === 0) {
     const err = new Error(
@@ -1630,6 +1683,15 @@ async function fetchSecFundamentalActuals(
   warnings.push(
     "SEC quarterly normalization uses pure single-quarter extraction and derives Q4 from FY minus 9M when needed."
   );
+
+  const coverage = buildCoverageAssessment(
+    annuals,
+    quarterlies,
+    ttm,
+    instrumentType
+  );
+  sourceStatus.push(...coverage.sourceStatus);
+  warnings.push(...coverage.warnings);
 
   return { data: { annuals, quarterlies, ttm }, sourceStatus, warnings };
 }
@@ -2054,7 +2116,8 @@ app.post("/v1/fundamental-actuals-pack", async (req, res) => {
             symbol,
             annualYears,
             quarterlyPeriods,
-            includeTtm
+            includeTtm,
+            instrument_type
           );
         } catch (secErr) {
           const secSourceStatus = secErr?.sourceStatus || [];
