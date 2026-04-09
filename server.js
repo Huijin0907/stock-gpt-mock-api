@@ -8,6 +8,9 @@ const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY || "";
 const ALPHAVANTAGE_API_KEY = process.env.ALPHAVANTAGE_API_KEY || "";
 const FMP_API_KEY = process.env.FMP_API_KEY || "";
 const MARKETSTACK_ACCESS_KEY = process.env.MARKETSTACK_ACCESS_KEY || "";
+const FRED_API_KEY = process.env.FRED_API_KEY || "";
+const TRADINGECONOMICS_API_KEY =
+  process.env.TRADINGECONOMICS_API_KEY || "guest:guest";
 const SEC_USER_AGENT =
   process.env.SEC_USER_AGENT ||
   "stock-gpt-mock-api/1.0 (+https://stock-gpt-mock-api.onrender.com)";
@@ -2229,8 +2232,1831 @@ app.post("/v1/fundamental-actuals-pack", async (req, res) => {
     actualsInflight.delete(cacheKey);
   }
 });
+function normalizeArrayPayload(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (Array.isArray(payload?.data)) return payload.data;
+  if (Array.isArray(payload?.results)) return payload.results;
+  if (Array.isArray(payload?.earningsCalendar)) return payload.earningsCalendar;
+  if (Array.isArray(payload?.calendar)) return payload.calendar;
+  return [];
+}
 
-app.post("/v1/estimates-targets-pack", (req, res) => {
+function parseIsoDate(value) {
+  if (!value) return null;
+  const t = Date.parse(value);
+  return Number.isFinite(t) ? new Date(t) : null;
+}
+
+function inferCurrentFiscalYear(symbol, asOf = new Date()) {
+  const fye = knownFiscalYearEnd[symbol] || "12-31";
+  const [mm, dd] = String(fye).split("-").map((x) => Number(x));
+  const year = asOf.getUTCFullYear();
+  const month = asOf.getUTCMonth() + 1;
+  const day = asOf.getUTCDate();
+  if (month > mm || (month === mm && day > dd)) return year + 1;
+  return year;
+}
+
+function parseEstimateYear(raw) {
+  if (raw === null || raw === undefined) return null;
+  const s = String(raw).trim();
+  const m = s.match(/(20\d{2})/);
+  return m ? Number(m[1]) : null;
+}
+
+function pickFirstNum(obj, keys) {
+  for (const key of keys) {
+    const v = toNum(obj?.[key], null);
+    if (v !== null) return v;
+  }
+  return null;
+}
+
+async function fredGet(path, params = {}) {
+  if (!FRED_API_KEY) throw new Error("FRED_API_KEY missing");
+  const resp = await axios.get(`https://api.stlouisfed.org/fred/${path}`, {
+    params: { ...params, api_key: FRED_API_KEY, file_type: "json" },
+    timeout: 15000
+  });
+  return resp.data;
+}
+
+async function tradingEconomicsGet(path, params = {}) {
+  const resp = await axios.get(`https://api.tradingeconomics.com${path}`, {
+    params: { ...params, c: TRADINGECONOMICS_API_KEY, f: "json" },
+    timeout: 15000
+  });
+  return resp.data;
+}
+
+async function treasuryXmlGet(url) {
+  const resp = await axios.get(url, {
+    headers: {
+      "User-Agent": SEC_USER_AGENT,
+      Accept: "application/xml, text/xml;q=0.9, */*;q=0.8"
+    },
+    timeout: 15000
+  });
+  return String(resp.data || "");
+}
+
+function extractLatestXmlTagValue(xml, tagName) {
+  const re = new RegExp(`<${tagName}>([^<]+)</${tagName}>`, "g");
+  const matches = [...xml.matchAll(re)];
+  if (!matches.length) return null;
+  const raw = matches[matches.length - 1][1];
+  return toNum(raw, null);
+}
+
+async function fredLatestObservation(seriesId) {
+  const payload = await fredGet("series/observations", {
+    series_id: seriesId,
+    sort_order: "desc",
+    limit: 12
+  });
+  const rows = Array.isArray(payload?.observations) ? payload.observations : [];
+  for (const row of rows) {
+    const v = toNum(row?.value, null);
+    if (v !== null) return { date: row.date || null, value: v };
+  }
+  return { date: null, value: null };
+}
+
+async function fredYoy(seriesId) {
+  const payload = await fredGet("series/observations", {
+    series_id: seriesId,
+    sort_order: "desc",
+    limit: 24
+  });
+  const rows = Array.isArray(payload?.observations) ? payload.observations : [];
+  const clean = rows
+    .map((r) => ({ date: r?.date || null, value: toNum(r?.value, null) }))
+    .filter((r) => r.value !== null);
+  if (clean.length < 13) return { date: clean[0]?.date || null, value: null };
+  return {
+    date: clean[0].date,
+    value: clean[12].value !== 0 ? clean[0].value / clean[12].value - 1 : null
+  };
+}
+
+async function fredDiffLatest(seriesId) {
+  const payload = await fredGet("series/observations", {
+    series_id: seriesId,
+    sort_order: "desc",
+    limit: 3
+  });
+  const rows = Array.isArray(payload?.observations) ? payload.observations : [];
+  const clean = rows
+    .map((r) => ({ date: r?.date || null, value: toNum(r?.value, null) }))
+    .filter((r) => r.value !== null);
+  if (clean.length < 2) return { date: clean[0]?.date || null, value: null };
+  return { date: clean[0].date, value: clean[0].value - clean[1].value };
+}
+
+async function tryFinnhub(path, params, providerName, sourceStatus, warnings) {
+  try {
+    const data = await finnhubGet(path, params);
+    sourceStatus.push({ provider: providerName, status: "ok", note: `${providerName} loaded` });
+    return data;
+  } catch (e) {
+    sourceStatus.push({
+      provider: providerName,
+      status: "partial",
+      note: `${providerName} unavailable: ${e.message}`
+    });
+    warnings.push(`${providerName} unavailable: ${e.message}`);
+    return null;
+  }
+}
+
+function normalizeRecommendationTrendRows(payload) {
+  return normalizeArrayPayload(payload)
+    .map((r) => ({
+      period: r?.period || null,
+      strongBuy: toNum(r?.strongBuy, null),
+      buy: toNum(r?.buy, null),
+      hold: toNum(r?.hold, null),
+      sell: toNum(r?.sell, null),
+      strongSell: toNum(r?.strongSell, null)
+    }))
+    .filter((r) => r.period);
+}
+
+function normalizeFinnhubEarningsCalendar(payload, symbol) {
+  const rows = normalizeArrayPayload(payload);
+  const filtered = rows
+    .filter((r) => String(r?.symbol || "").toUpperCase() === symbol)
+    .sort((a, b) => secParseDateMs(a?.date) - secParseDateMs(b?.date));
+  return filtered[0] || null;
+}
+
+function normalizeEstimateRows(payload, valueKeys = []) {
+  return normalizeArrayPayload(payload)
+    .map((r) => ({
+      year: parseEstimateYear(r?.year ?? r?.period ?? r?.date ?? r?.fiscalYear),
+      period: r?.period || r?.date || r?.year || null,
+      avg: pickFirstNum(r, valueKeys),
+      high: pickFirstNum(r, ["high", "estimateHigh", "epsHigh", "revenueHigh"]),
+      low: pickFirstNum(r, ["low", "estimateLow", "epsLow", "revenueLow"]),
+      analysts: pickFirstNum(r, ["numberAnalysts", "analystCount", "analysts"]),
+      raw: r
+    }))
+    .filter((r) => r.year !== null);
+}
+
+function mapAnnualEstimateRowsToFY(rows, currentFY) {
+  const byYear = new Map();
+  for (const row of rows) {
+    if (!byYear.has(row.year)) byYear.set(row.year, row);
+  }
+  return {
+    fy0: byYear.get(currentFY) || null,
+    fy1: byYear.get(currentFY + 1) || null,
+    fy2: byYear.get(currentFY + 2) || null
+  };
+}
+
+function buildEstimateCoverage({ recommendation, earningsCalendar, epsMap, revenueMap, priceTarget }) {
+  const hasRecommendation = !!recommendation;
+  const hasCalendar = !!earningsCalendar;
+  const hasAnnualEstimates =
+    !!(epsMap?.fy0?.avg || epsMap?.fy1?.avg || revenueMap?.fy0?.avg || revenueMap?.fy1?.avg);
+  const hasPriceTarget =
+    !!(
+      priceTarget &&
+      [
+        toNum(priceTarget?.target_mean, null),
+        toNum(priceTarget?.target_high, null),
+        toNum(priceTarget?.target_low, null),
+        toNum(priceTarget?.target_median, null)
+      ].some((v) => v !== null)
+    );
+
+  if (hasRecommendation && hasCalendar && hasAnnualEstimates && hasPriceTarget) {
+    return "full";
+  }
+  if (hasRecommendation || hasCalendar || hasAnnualEstimates || hasPriceTarget) {
+    return "partial";
+  }
+  return "unavailable";
+}
+
+async function buildEstimatesTargetsPack(symbol) {
+  const sourceStatus = [];
+  const warnings = [];
+  const currentFY = inferCurrentFiscalYear(symbol);
+
+  const recommendationPayload = await tryFinnhub(
+    "/stock/recommendation",
+    { symbol },
+    "finnhub_recommendation_trends",
+    sourceStatus,
+    warnings
+  );
+  const earningsCalendarPayload = await tryFinnhub(
+    "/calendar/earnings",
+    {
+      symbol,
+      from: formatDateYYYYMMDD(new Date()),
+      to: formatDateYYYYMMDD(new Date(Date.now() + 120 * 86400000))
+    },
+    "finnhub_earnings_calendar",
+    sourceStatus,
+    warnings
+  );
+  const epsEstimatePayload = await tryFinnhub(
+    "/stock/eps-estimate",
+    { symbol, freq: "annual" },
+    "finnhub_eps_estimate",
+    sourceStatus,
+    warnings
+  );
+  const revenueEstimatePayload = await tryFinnhub(
+    "/stock/revenue-estimate",
+    { symbol, freq: "annual" },
+    "finnhub_revenue_estimate",
+    sourceStatus,
+    warnings
+  );
+  const priceTargetPayload = await tryFinnhub(
+    "/stock/price-target",
+    { symbol },
+    "finnhub_price_target",
+    sourceStatus,
+    warnings
+  );
+
+  const recommendationRows = normalizeRecommendationTrendRows(recommendationPayload);
+  const latestRecommendation = recommendationRows.sort(
+    (a, b) => secParseDateMs(b.period) - secParseDateMs(a.period)
+  )[0] || null;
+
+  const earningsCalendar = normalizeFinnhubEarningsCalendar(earningsCalendarPayload, symbol);
+
+  const epsRows = normalizeEstimateRows(epsEstimatePayload, [
+    "avg",
+    "estimate",
+    "epsAvg",
+    "epsMean",
+    "value"
+  ]);
+  const revenueRows = normalizeEstimateRows(revenueEstimatePayload, [
+    "avg",
+    "estimate",
+    "revenueAvg",
+    "revenueMean",
+    "value"
+  ]);
+  const epsMap = mapAnnualEstimateRowsToFY(epsRows, currentFY);
+  const revenueMap = mapAnnualEstimateRowsToFY(revenueRows, currentFY);
+
+  const canonicalPriceTarget =
+    priceTargetPayload && typeof priceTargetPayload === "object"
+      ? {
+          target_mean: toNum(priceTargetPayload?.targetMean, null),
+          target_high: toNum(priceTargetPayload?.targetHigh, null),
+          target_low: toNum(priceTargetPayload?.targetLow, null),
+          target_median: toNum(priceTargetPayload?.targetMedian, null),
+          last_updated: priceTargetPayload?.lastUpdated || null,
+          provider: "finnhub_price_target"
+        }
+      : null;
+
+  const coverageAssessment = buildEstimateCoverage({
+    recommendation: latestRecommendation,
+    earningsCalendar,
+    epsMap,
+    revenueMap,
+    priceTarget: canonicalPriceTarget
+  });
+
+  if (coverageAssessment === "unavailable") {
+    warnings.push("No usable structured estimates data was returned; all estimate fields remain null.");
+  }
+
+  const analystCount =
+    epsMap?.fy1?.analysts ??
+    epsMap?.fy0?.analysts ??
+    revenueMap?.fy1?.analysts ??
+    revenueMap?.fy0?.analysts ??
+    null;
+
+  const out = {
+    coverage_assessment: coverageAssessment,
+    current_fiscal_year: currentFY,
+    canonical_estimates: {
+      recommendation_trends: latestRecommendation
+        ? {
+            period: latestRecommendation.period,
+            strong_buy: latestRecommendation.strongBuy,
+            buy: latestRecommendation.buy,
+            hold: latestRecommendation.hold,
+            sell: latestRecommendation.sell,
+            strong_sell: latestRecommendation.strongSell,
+            provider: "finnhub_recommendation_trends"
+          }
+        : null,
+      earnings_calendar: earningsCalendar
+        ? {
+            date: earningsCalendar?.date || null,
+            hour: earningsCalendar?.hour || null,
+            eps_estimate: toNum(
+              earningsCalendar?.epsEstimate ?? earningsCalendar?.epsActualEstimate,
+              null
+            ),
+            revenue_estimate: toNum(
+              earningsCalendar?.revenueEstimate ?? earningsCalendar?.revenueActualEstimate,
+              null
+            ),
+            provider: "finnhub_earnings_calendar",
+            estimate_basis: "non_gaap_or_unknown"
+          }
+        : null,
+      eps_revenue_estimates: {
+        eps_fy0_est: epsMap?.fy0?.avg ?? null,
+        eps_fy1_est: epsMap?.fy1?.avg ?? null,
+        eps_fy2_est: epsMap?.fy2?.avg ?? null,
+        revenue_fy0_est: revenueMap?.fy0?.avg ?? null,
+        revenue_fy1_est: revenueMap?.fy1?.avg ?? null,
+        revenue_fy2_est: revenueMap?.fy2?.avg ?? null,
+        eps_basis: epsRows.length > 0 ? "non_gaap_or_unknown" : "unknown",
+        revenue_basis: revenueRows.length > 0 ? "reported_currency_or_unknown" : "unknown",
+        provider:
+          epsRows.length > 0 || revenueRows.length > 0
+            ? "finnhub_eps_revenue_estimates"
+            : null
+      },
+      analyst_price_targets:
+        canonicalPriceTarget &&
+        [
+          canonicalPriceTarget.target_mean,
+          canonicalPriceTarget.target_high,
+          canonicalPriceTarget.target_low,
+          canonicalPriceTarget.target_median
+        ].some((v) => v !== null)
+          ? canonicalPriceTarget
+          : null
+    },
+    reference_estimates: {
+      provider: null,
+      usage: "reference_only_not_canonical",
+      notes: []
+    },
+    event_context: {
+      next_earnings_date: earningsCalendar?.date || null,
+      next_earnings_hour: earningsCalendar?.hour || null,
+      provider: earningsCalendar ? "finnhub_earnings_calendar" : null
+    },
+
+    eps_fy0_est: epsMap?.fy0?.avg ?? null,
+    eps_fy1_est: epsMap?.fy1?.avg ?? null,
+    eps_fy2_est: epsMap?.fy2?.avg ?? null,
+    revenue_fy0_est: revenueMap?.fy0?.avg ?? null,
+    revenue_fy1_est: revenueMap?.fy1?.avg ?? null,
+    revenue_fy2_est: revenueMap?.fy2?.avg ?? null,
+    target_price_consensus: canonicalPriceTarget?.target_mean ?? null,
+    target_price_low: canonicalPriceTarget?.target_low ?? null,
+    target_price_high: canonicalPriceTarget?.target_high ?? null,
+    analyst_count: analystCount,
+    estimate_revision_direction: null,
+    next_earnings_date: earningsCalendar?.date || null
+  };
+
+  return { data: out, sourceStatus, warnings };
+}
+
+async function getQuoteWithFallback(symbol) {
+  const sourceStatus = [];
+  let data = null;
+
+  try {
+    const q = await finnhubGet("/quote", { symbol });
+    if (q && toNum(q.c, null) !== null) {
+      data = {
+        provider: "finnhub_quote",
+        symbol,
+        price: toNum(q.c, null),
+        change: toNum(q.d, null),
+        change_pct: toNum(q.dp, null),
+        ts: q.t ? new Date(q.t * 1000).toISOString() : null
+      };
+      sourceStatus.push({ provider: "finnhub_quote", status: "ok", note: "quote loaded" });
+      return { data, sourceStatus };
+    }
+    sourceStatus.push({ provider: "finnhub_quote", status: "partial", note: "empty quote response" });
+  } catch (e) {
+    sourceStatus.push({ provider: "finnhub_quote", status: "partial", note: `quote unavailable: ${e.message}` });
+  }
+
+  try {
+    const alpha = await alphaGet({ function: "GLOBAL_QUOTE", symbol });
+    const q = alpha?.["Global Quote"] || {};
+    const price = toNum(q["05. price"], null);
+    if (price !== null) {
+      data = {
+        provider: "alpha_global_quote",
+        symbol,
+        price,
+        change: toNum(q["09. change"], null),
+        change_pct: toNum(String(q["10. change percent"] || "").replace("%", ""), null),
+        ts: null
+      };
+      sourceStatus.push({ provider: "alpha_global_quote", status: "ok", note: "global quote loaded" });
+      return { data, sourceStatus };
+    }
+    sourceStatus.push({ provider: "alpha_global_quote", status: "partial", note: "alpha global quote empty" });
+  } catch (e) {
+    sourceStatus.push({ provider: "alpha_global_quote", status: "partial", note: `alpha global quote unavailable: ${e.message}` });
+  }
+
+  return { data: null, sourceStatus };
+}
+
+async function getProxyQuoteMap(symbols = []) {
+  const results = await Promise.all(symbols.map((s) => getQuoteWithFallback(s)));
+  const map = {};
+  const sourceStatus = [];
+  for (let i = 0; i < symbols.length; i++) {
+    map[symbols[i]] = results[i].data;
+    sourceStatus.push(...results[i].sourceStatus);
+  }
+  return { map, sourceStatus };
+}
+
+function selectTopBottomByChange(quotes = {}) {
+  const rows = Object.entries(quotes)
+    .map(([symbol, q]) => ({
+      symbol,
+      change_pct: toNum(q?.change_pct, null)
+    }))
+    .filter((r) => r.change_pct !== null)
+    .sort((a, b) => b.change_pct - a.change_pct);
+
+  return {
+    leaders: rows.slice(0, 2),
+    laggards: rows.slice(-2).reverse()
+  };
+}
+
+function classifyMarketState({ spy, qqq, iwm, vix }) {
+  const pos = [spy, qqq, iwm].filter((x) => x !== null && x > 0).length;
+  if (vix !== null && vix >= 25 && pos <= 1) return "risk_off_high_vol";
+  if (pos === 3 && (vix === null || vix < 20)) return "trend_up_broadening";
+  if (pos >= 2) return "trend_up_but_selective";
+  if (pos === 1) return "mixed";
+  return "risk_off";
+}
+
+function classifyBreadthHealth({ leaders, laggards, spy, iwm, qqq }) {
+  const leaderPos = leaders.filter((x) => x.change_pct !== null && x.change_pct > 0).length;
+  const laggardNeg = laggards.filter((x) => x.change_pct !== null && x.change_pct < 0).length;
+  if (spy !== null && qqq !== null && iwm !== null && spy > 0 && qqq > 0 && iwm > 0 && leaderPos >= 2) {
+    return "healthy";
+  }
+  if (spy !== null && qqq !== null && iwm !== null && qqq > 0 && iwm < 0) {
+    return "narrow";
+  }
+  if (laggardNeg >= 2) return "weak";
+  return "neutral";
+}
+
+function classifyLiquidityState({ us10y, real10y, vix, breadthHealth }) {
+  if ((us10y !== null && us10y >= 4.5) || (real10y !== null && real10y >= 2.0) || (vix !== null && vix >= 25)) {
+    return "tight";
+  }
+  if (breadthHealth === "healthy" && (vix === null || vix < 20)) return "supportive";
+  return "neutral";
+}
+
+function classifyMacroRegime({ cpiYoy, unemployment, payrolls }) {
+  if (cpiYoy !== null && cpiYoy > 0.035 && unemployment !== null && unemployment < 0.045) {
+    return "inflationary_with_resilient_growth";
+  }
+  if (cpiYoy !== null && cpiYoy < 0.03 && payrolls !== null && payrolls > 0) {
+    return "disinflation_with_stable_growth";
+  }
+  return "mixed";
+}
+
+function shouldEnterValuation({ instrumentType = "us_equity", liquidityState, macroRiskLevel }) {
+  if (!["us_equity", "adr_equity"].includes(instrumentType)) return "background_only";
+  if (macroRiskLevel === "high") return "scenario_only";
+  if (liquidityState === "tight") return "scenario_only";
+  return "direct";
+}
+
+async function buildMacroBreadthLiquidityPack(symbol) {
+  const sourceStatus = [];
+  const warnings = [];
+  const { instrument_type } = classifyLocal(symbol);
+
+  const fredSeries = {
+    cpi_yoy: null,
+    core_cpi_yoy: null,
+    pce_yoy: null,
+    core_pce_yoy: null,
+    unemployment_rate: null,
+    payrolls_last_change: null,
+    retail_sales_yoy: null,
+    ism_manufacturing: null,
+    dxy_broad: null,
+    wti: null,
+    brent: null,
+    gold: null,
+    silver: null,
+    copper: null,
+    natgas: null,
+    vix: null,
+    sp500: null,
+    nasdaq: null
+  };
+
+  if (FRED_API_KEY) {
+    try {
+      const [
+        cpiYoy,
+        coreCpiYoy,
+        pceYoy,
+        corePceYoy,
+        unrate,
+        payrollDiff,
+        retailYoy,
+        ismMfg,
+        dxyBroad,
+        wti,
+        brent,
+        gold,
+        silver,
+        copper,
+        natgas,
+        vix,
+        sp500,
+        nasdaq
+      ] = await Promise.all([
+        fredYoy("CPIAUCSL"),
+        fredYoy("CPILFESL"),
+        fredYoy("PCEPI"),
+        fredYoy("PCEPILFE"),
+        fredLatestObservation("UNRATE"),
+        fredDiffLatest("PAYEMS"),
+        fredYoy("RSAFS"),
+        fredLatestObservation("NAPM"),
+        fredLatestObservation("DTWEXBGS"),
+        fredLatestObservation("DCOILWTICO"),
+        fredLatestObservation("DCOILBRENTEU"),
+        fredLatestObservation("GOLDAMGBD228NLBM"),
+        fredLatestObservation("SLVPRUSD"),
+        fredLatestObservation("PCOPPUSDM"),
+        fredLatestObservation("DHHNGSP"),
+        fredLatestObservation("VIXCLS"),
+        fredLatestObservation("SP500"),
+        fredLatestObservation("NASDAQCOM")
+      ]);
+
+      fredSeries.cpi_yoy = cpiYoy.value;
+      fredSeries.core_cpi_yoy = coreCpiYoy.value;
+      fredSeries.pce_yoy = pceYoy.value;
+      fredSeries.core_pce_yoy = corePceYoy.value;
+      fredSeries.unemployment_rate = unrate.value;
+      fredSeries.payrolls_last_change = payrollDiff.value;
+      fredSeries.retail_sales_yoy = retailYoy.value;
+      fredSeries.ism_manufacturing = ismMfg.value;
+      fredSeries.dxy_broad = dxyBroad.value;
+      fredSeries.wti = wti.value;
+      fredSeries.brent = brent.value;
+      fredSeries.gold = gold.value;
+      fredSeries.silver = silver.value;
+      fredSeries.copper = copper.value;
+      fredSeries.natgas = natgas.value;
+      fredSeries.vix = vix.value;
+      fredSeries.sp500 = sp500.value;
+      fredSeries.nasdaq = nasdaq.value;
+
+      sourceStatus.push({ provider: "fred", status: "ok", note: "macro series loaded" });
+    } catch (e) {
+      sourceStatus.push({ provider: "fred", status: "partial", note: `fred macro series unavailable: ${e.message}` });
+      warnings.push(`fred macro series unavailable: ${e.message}`);
+    }
+  } else {
+    sourceStatus.push({ provider: "fred", status: "partial", note: "FRED_API_KEY missing" });
+    warnings.push("FRED_API_KEY missing; macro series coverage reduced.");
+  }
+
+  let treasuryRates = { us2y: null, us10y: null, us30y: null, real10y: null };
+  try {
+    const nominalXml = await treasuryXmlGet(
+      "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml?data=daily_treasury_yield_curve"
+    );
+    const realXml = await treasuryXmlGet(
+      "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml?data=daily_treasury_real_yield_curve"
+    );
+    treasuryRates.us2y = extractLatestXmlTagValue(nominalXml, "BC_2YEAR");
+    treasuryRates.us10y = extractLatestXmlTagValue(nominalXml, "BC_10YEAR");
+    treasuryRates.us30y = extractLatestXmlTagValue(nominalXml, "BC_30YEAR");
+    treasuryRates.real10y = extractLatestXmlTagValue(realXml, "TC_10YEAR");
+    if (treasuryRates.us2y !== null || treasuryRates.us10y !== null || treasuryRates.real10y !== null) {
+      sourceStatus.push({ provider: "treasury", status: "ok", note: "treasury yield curves loaded" });
+    } else {
+      sourceStatus.push({ provider: "treasury", status: "partial", note: "treasury xml parsed but values empty" });
+    }
+  } catch (e) {
+    sourceStatus.push({ provider: "treasury", status: "partial", note: `treasury rates unavailable: ${e.message}` });
+    warnings.push(`treasury rates unavailable: ${e.message}`);
+  }
+
+  const proxies = [
+    "SPY", "QQQ", "DIA", "IWM",
+    "XLK", "XLF", "XLE", "XLV", "XLI", "XLP", "XLY", "XLB", "XLU", "XLRE", "XLC",
+    "VUG", "VTV"
+  ];
+  const { map: proxyQuotes, sourceStatus: proxySourceStatus } = await getProxyQuoteMap(proxies);
+  sourceStatus.push(...proxySourceStatus);
+
+  const sectors = {
+    Technology: proxyQuotes.XLK,
+    Financials: proxyQuotes.XLF,
+    Energy: proxyQuotes.XLE,
+    Healthcare: proxyQuotes.XLV,
+    Industrials: proxyQuotes.XLI,
+    Staples: proxyQuotes.XLP,
+    Discretionary: proxyQuotes.XLY,
+    Materials: proxyQuotes.XLB,
+    Utilities: proxyQuotes.XLU,
+    RealEstate: proxyQuotes.XLRE,
+    Communication: proxyQuotes.XLC
+  };
+
+  const sectorRank = selectTopBottomByChange(
+    Object.fromEntries(
+      Object.entries(sectors).map(([k, v]) => [k, { change_pct: toNum(v?.change_pct, null) }])
+    )
+  );
+
+  let calendarEvents = [];
+  try {
+    const rawCalendar = await tradingEconomicsGet("/calendar");
+    calendarEvents = normalizeArrayPayload(rawCalendar)
+      .slice(0, 300)
+      .map((r) => ({
+        date: r?.Date || r?.date || null,
+        country: r?.Country || r?.country || null,
+        event: r?.Event || r?.event || null,
+        importance: r?.Importance || r?.importance || r?.Category || null,
+        actual: r?.Actual ?? null,
+        forecast: r?.Forecast ?? null,
+        previous: r?.Previous ?? null
+      }))
+      .filter((r) => r.date && r.event);
+    sourceStatus.push({ provider: "tradingeconomics_calendar", status: "ok", note: "calendar snapshot loaded" });
+  } catch (e) {
+    sourceStatus.push({ provider: "tradingeconomics_calendar", status: "partial", note: `calendar unavailable: ${e.message}` });
+    warnings.push(`calendar unavailable: ${e.message}`);
+  }
+
+  const nextByRegex = (regex) =>
+    calendarEvents
+      .filter((r) => regex.test(String(r.event || "")) && secParseDateMs(r.date) >= Date.now())
+      .sort((a, b) => secParseDateMs(a.date) - secParseDateMs(b.date))[0] || null;
+
+  const nextCpi = nextByRegex(/\bCPI\b|Consumer Price/i);
+  const nextNfp = nextByRegex(/Non Farm Payroll|Nonfarm Payroll|Payroll/i);
+  const nextFomc = nextByRegex(/FOMC|Federal Reserve|Interest Rate Decision/i);
+  const nextPce = nextByRegex(/\bPCE\b|Personal Consumption Expenditure/i);
+  const nextRetail = nextByRegex(/Retail Sales/i);
+
+  const spyChg = toNum(proxyQuotes.SPY?.change_pct, null);
+  const qqqChg = toNum(proxyQuotes.QQQ?.change_pct, null);
+  const iwmChg = toNum(proxyQuotes.IWM?.change_pct, null);
+
+  const marketState = classifyMarketState({
+    spy: spyChg,
+    qqq: qqqChg,
+    iwm: iwmChg,
+    vix: fredSeries.vix
+  });
+  const breadthHealth = classifyBreadthHealth({
+    leaders: sectorRank.leaders,
+    laggards: sectorRank.laggards,
+    spy: spyChg,
+    iwm: iwmChg,
+    qqq: qqqChg
+  });
+  const liquidityState = classifyLiquidityState({
+    us10y: treasuryRates.us10y,
+    real10y: treasuryRates.real10y,
+    vix: fredSeries.vix,
+    breadthHealth
+  });
+  const macroRegime = classifyMacroRegime({
+    cpiYoy: fredSeries.cpi_yoy,
+    unemployment: fredSeries.unemployment_rate,
+    payrolls: fredSeries.payrolls_last_change
+  });
+
+  const calendarRiskLevel =
+    [nextCpi, nextNfp, nextFomc].filter(Boolean).length >= 2
+      ? "high"
+      : [nextCpi, nextNfp, nextFomc].filter(Boolean).length === 1
+      ? "medium"
+      : "low";
+
+  const shouldValuation = shouldEnterValuation({
+    instrumentType: instrument_type,
+    liquidityState,
+    macroRiskLevel: calendarRiskLevel
+  });
+
+  const out = {
+    as_of_time: new Date().toISOString(),
+    rates: {
+      us2y: treasuryRates.us2y,
+      us10y: treasuryRates.us10y,
+      us30y: treasuryRates.us30y,
+      real10y: treasuryRates.real10y,
+      curve_2s10s:
+        treasuryRates.us10y !== null && treasuryRates.us2y !== null
+          ? treasuryRates.us10y - treasuryRates.us2y
+          : null,
+      rate_regime:
+        treasuryRates.us10y !== null
+          ? treasuryRates.us10y >= 4.5
+            ? "high_rate"
+            : treasuryRates.us10y >= 3.5
+            ? "restrictive_but_normalized"
+            : "accommodative"
+          : null,
+      valuation_pressure:
+        treasuryRates.us10y !== null || treasuryRates.real10y !== null
+          ? liquidityState === "tight"
+            ? "high"
+            : liquidityState === "supportive"
+            ? "low"
+            : "medium"
+          : null
+    },
+    macro_calendar: {
+      next_cpi: nextCpi,
+      next_nfp: nextNfp,
+      next_fomc: nextFomc,
+      next_pce: nextPce,
+      next_retail_sales: nextRetail,
+      calendar_risk_level: calendarRiskLevel
+    },
+    macro_series: {
+      cpi_yoy: fredSeries.cpi_yoy,
+      core_cpi_yoy: fredSeries.core_cpi_yoy,
+      pce_yoy: fredSeries.pce_yoy,
+      core_pce_yoy: fredSeries.core_pce_yoy,
+      unemployment_rate: fredSeries.unemployment_rate,
+      payrolls_last_change: fredSeries.payrolls_last_change,
+      retail_sales_yoy: fredSeries.retail_sales_yoy,
+      ism_manufacturing: fredSeries.ism_manufacturing,
+      macro_growth_inflation_mix:
+        fredSeries.cpi_yoy !== null && fredSeries.unemployment_rate !== null
+          ? fredSeries.cpi_yoy > 0.03 && fredSeries.unemployment_rate < 0.045
+            ? "hot_growth_hot_inflation"
+            : fredSeries.cpi_yoy < 0.03 && fredSeries.unemployment_rate < 0.05
+            ? "soft_landing"
+            : "mixed"
+          : null
+    },
+    market_environment: {
+      spx_proxy: proxyQuotes.SPY,
+      ndx_proxy: proxyQuotes.QQQ,
+      dji_proxy: proxyQuotes.DIA,
+      rut_proxy: proxyQuotes.IWM,
+      vix: fredSeries.vix,
+      top_sector_1: sectorRank.leaders[0] || null,
+      top_sector_2: sectorRank.leaders[1] || null,
+      weakest_sector_1: sectorRank.laggards[0] || null,
+      weakest_sector_2: sectorRank.laggards[1] || null,
+      growth_vs_value:
+        toNum(proxyQuotes.VUG?.change_pct, null) !== null &&
+        toNum(proxyQuotes.VTV?.change_pct, null) !== null
+          ? proxyQuotes.VUG.change_pct > proxyQuotes.VTV.change_pct
+            ? "growth_outperforming"
+            : "value_outperforming"
+          : null,
+      large_vs_small:
+        spyChg !== null && iwmChg !== null
+          ? spyChg > iwmChg
+            ? "large_outperforming"
+            : "small_outperforming"
+          : null,
+      market_state: marketState
+    },
+    breadth: {
+      breadth_health: breadthHealth,
+      sector_leadership: {
+        leaders: sectorRank.leaders,
+        laggards: sectorRank.laggards
+      },
+      leadership_concentration:
+        qqqChg !== null && iwmChg !== null
+          ? qqqChg > iwmChg
+            ? "mega_cap_concentrated"
+            : "broadening"
+          : null,
+      risk_appetite:
+        marketState === "trend_up_broadening"
+          ? "risk_on"
+          : marketState === "risk_off_high_vol" || marketState === "risk_off"
+          ? "risk_off"
+          : "mixed"
+    },
+    liquidity: {
+      liquidity_state: liquidityState,
+      credit_conditions_note:
+        treasuryRates.us10y !== null && treasuryRates.us10y >= 4.5
+          ? "long-end yields remain restrictive"
+          : "no acute rate stress signal",
+      funding_stress_note:
+        fredSeries.vix !== null && fredSeries.vix >= 25
+          ? "volatility elevated; monitor funding and positioning"
+          : "no acute volatility stress signal"
+    },
+    commodities_fx: {
+      dxy_broad: fredSeries.dxy_broad,
+      wti: fredSeries.wti,
+      brent: fredSeries.brent,
+      gold: fredSeries.gold,
+      silver: fredSeries.silver,
+      copper: fredSeries.copper,
+      natgas: fredSeries.natgas,
+      usd_regime:
+        fredSeries.dxy_broad !== null
+          ? fredSeries.dxy_broad >= 125
+            ? "usd_strong"
+            : "usd_neutral"
+          : null,
+      commodity_regime:
+        fredSeries.wti !== null && fredSeries.gold !== null
+          ? fredSeries.wti > 85
+            ? "energy_tight"
+            : fredSeries.gold > 2200
+            ? "defensive_precious_metals_bid"
+            : "mixed"
+          : null
+    },
+    final_labels: {
+      macro_regime: macroRegime,
+      market_state: marketState,
+      liquidity_state: liquidityState,
+      breadth_health: breadthHealth,
+      should_enter_valuation: shouldValuation
+    },
+
+    macro_regime: macroRegime,
+    market_state: marketState,
+    liquidity_state: liquidityState,
+    should_enter_valuation: shouldValuation,
+    risk_free_rate:
+      treasuryRates.us10y !== null ? treasuryRates.us10y / 100 : null,
+    yield_curve_slope:
+      treasuryRates.us10y !== null && treasuryRates.us2y !== null
+        ? (treasuryRates.us10y - treasuryRates.us2y) / 100
+        : null,
+    usd_context:
+      fredSeries.dxy_broad !== null
+        ? fredSeries.dxy_broad >= 125
+          ? "firm"
+          : "neutral"
+        : null,
+    breadth_score:
+      breadthHealth === "healthy" ? 75 :
+      breadthHealth === "narrow" ? 45 :
+      breadthHealth === "weak" ? 35 :
+      breadthHealth === "neutral" ? 55 : null,
+    breadth_health: breadthHealth,
+    breadth_notes: [
+      sectorRank.leaders[0]
+        ? `Leading sector proxy: ${sectorRank.leaders[0].symbol} (${sectorRank.leaders[0].change_pct}%).`
+        : "No sector leadership signal available.",
+      sectorRank.laggards[0]
+        ? `Weakest sector proxy: ${sectorRank.laggards[0].symbol} (${sectorRank.laggards[0].change_pct}%).`
+        : "No sector laggard signal available.",
+      calendarRiskLevel === "high"
+        ? "High macro event density ahead."
+        : "No clustered macro risk window detected."
+    ]
+  };
+
+  return { data: out, sourceStatus, warnings };
+}
+
+function normalizeArrayPayload(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (Array.isArray(payload?.data)) return payload.data;
+  if (Array.isArray(payload?.results)) return payload.results;
+  if (Array.isArray(payload?.earningsCalendar)) return payload.earningsCalendar;
+  if (Array.isArray(payload?.calendar)) return payload.calendar;
+  return [];
+}
+
+function parseIsoDate(value) {
+  if (!value) return null;
+  const t = Date.parse(value);
+  return Number.isFinite(t) ? new Date(t) : null;
+}
+
+function inferCurrentFiscalYear(symbol, asOf = new Date()) {
+  const fye = knownFiscalYearEnd[symbol] || "12-31";
+  const [mm, dd] = String(fye).split("-").map((x) => Number(x));
+  const year = asOf.getUTCFullYear();
+  const month = asOf.getUTCMonth() + 1;
+  const day = asOf.getUTCDate();
+  if (month > mm || (month === mm && day > dd)) return year + 1;
+  return year;
+}
+
+function parseEstimateYear(raw) {
+  if (raw === null || raw === undefined) return null;
+  const s = String(raw).trim();
+  const m = s.match(/(20\d{2})/);
+  return m ? Number(m[1]) : null;
+}
+
+function pickFirstNum(obj, keys) {
+  for (const key of keys) {
+    const v = toNum(obj?.[key], null);
+    if (v !== null) return v;
+  }
+  return null;
+}
+
+async function fredGet(path, params = {}) {
+  if (!FRED_API_KEY) throw new Error("FRED_API_KEY missing");
+  const resp = await axios.get(`https://api.stlouisfed.org/fred/${path}`, {
+    params: { ...params, api_key: FRED_API_KEY, file_type: "json" },
+    timeout: 15000
+  });
+  return resp.data;
+}
+
+async function tradingEconomicsGet(path, params = {}) {
+  const resp = await axios.get(`https://api.tradingeconomics.com${path}`, {
+    params: { ...params, c: TRADINGECONOMICS_API_KEY, f: "json" },
+    timeout: 15000
+  });
+  return resp.data;
+}
+
+async function treasuryXmlGet(url) {
+  const resp = await axios.get(url, {
+    headers: {
+      "User-Agent": SEC_USER_AGENT,
+      Accept: "application/xml, text/xml;q=0.9, */*;q=0.8"
+    },
+    timeout: 15000
+  });
+  return String(resp.data || "");
+}
+
+function extractLatestXmlTagValue(xml, tagName) {
+  const re = new RegExp(`<${tagName}>([^<]+)</${tagName}>`, "g");
+  const matches = [...xml.matchAll(re)];
+  if (!matches.length) return null;
+  const raw = matches[matches.length - 1][1];
+  return toNum(raw, null);
+}
+
+async function fredLatestObservation(seriesId) {
+  const payload = await fredGet("series/observations", {
+    series_id: seriesId,
+    sort_order: "desc",
+    limit: 12
+  });
+  const rows = Array.isArray(payload?.observations) ? payload.observations : [];
+  for (const row of rows) {
+    const v = toNum(row?.value, null);
+    if (v !== null) return { date: row.date || null, value: v };
+  }
+  return { date: null, value: null };
+}
+
+async function fredYoy(seriesId) {
+  const payload = await fredGet("series/observations", {
+    series_id: seriesId,
+    sort_order: "desc",
+    limit: 24
+  });
+  const rows = Array.isArray(payload?.observations) ? payload.observations : [];
+  const clean = rows
+    .map((r) => ({ date: r?.date || null, value: toNum(r?.value, null) }))
+    .filter((r) => r.value !== null);
+  if (clean.length < 13) return { date: clean[0]?.date || null, value: null };
+  return {
+    date: clean[0].date,
+    value: clean[12].value !== 0 ? clean[0].value / clean[12].value - 1 : null
+  };
+}
+
+async function fredDiffLatest(seriesId) {
+  const payload = await fredGet("series/observations", {
+    series_id: seriesId,
+    sort_order: "desc",
+    limit: 3
+  });
+  const rows = Array.isArray(payload?.observations) ? payload.observations : [];
+  const clean = rows
+    .map((r) => ({ date: r?.date || null, value: toNum(r?.value, null) }))
+    .filter((r) => r.value !== null);
+  if (clean.length < 2) return { date: clean[0]?.date || null, value: null };
+  return { date: clean[0].date, value: clean[0].value - clean[1].value };
+}
+
+async function tryFinnhub(path, params, providerName, sourceStatus, warnings) {
+  try {
+    const data = await finnhubGet(path, params);
+    sourceStatus.push({ provider: providerName, status: "ok", note: `${providerName} loaded` });
+    return data;
+  } catch (e) {
+    sourceStatus.push({
+      provider: providerName,
+      status: "partial",
+      note: `${providerName} unavailable: ${e.message}`
+    });
+    warnings.push(`${providerName} unavailable: ${e.message}`);
+    return null;
+  }
+}
+
+function normalizeRecommendationTrendRows(payload) {
+  return normalizeArrayPayload(payload)
+    .map((r) => ({
+      period: r?.period || null,
+      strongBuy: toNum(r?.strongBuy, null),
+      buy: toNum(r?.buy, null),
+      hold: toNum(r?.hold, null),
+      sell: toNum(r?.sell, null),
+      strongSell: toNum(r?.strongSell, null)
+    }))
+    .filter((r) => r.period);
+}
+
+function normalizeFinnhubEarningsCalendar(payload, symbol) {
+  const rows = normalizeArrayPayload(payload);
+  const filtered = rows
+    .filter((r) => String(r?.symbol || "").toUpperCase() === symbol)
+    .sort((a, b) => secParseDateMs(a?.date) - secParseDateMs(b?.date));
+  return filtered[0] || null;
+}
+
+function normalizeEstimateRows(payload, valueKeys = []) {
+  return normalizeArrayPayload(payload)
+    .map((r) => ({
+      year: parseEstimateYear(r?.year ?? r?.period ?? r?.date ?? r?.fiscalYear),
+      period: r?.period || r?.date || r?.year || null,
+      avg: pickFirstNum(r, valueKeys),
+      high: pickFirstNum(r, ["high", "estimateHigh", "epsHigh", "revenueHigh"]),
+      low: pickFirstNum(r, ["low", "estimateLow", "epsLow", "revenueLow"]),
+      analysts: pickFirstNum(r, ["numberAnalysts", "analystCount", "analysts"]),
+      raw: r
+    }))
+    .filter((r) => r.year !== null);
+}
+
+function mapAnnualEstimateRowsToFY(rows, currentFY) {
+  const byYear = new Map();
+  for (const row of rows) {
+    if (!byYear.has(row.year)) byYear.set(row.year, row);
+  }
+  return {
+    fy0: byYear.get(currentFY) || null,
+    fy1: byYear.get(currentFY + 1) || null,
+    fy2: byYear.get(currentFY + 2) || null
+  };
+}
+
+function buildEstimateCoverage({ recommendation, earningsCalendar, epsMap, revenueMap, priceTarget }) {
+  const hasRecommendation = !!recommendation;
+  const hasCalendar = !!earningsCalendar;
+  const hasAnnualEstimates =
+    !!(epsMap?.fy0?.avg || epsMap?.fy1?.avg || revenueMap?.fy0?.avg || revenueMap?.fy1?.avg);
+  const hasPriceTarget =
+    !!(
+      priceTarget &&
+      [
+        toNum(priceTarget?.target_mean, null),
+        toNum(priceTarget?.target_high, null),
+        toNum(priceTarget?.target_low, null),
+        toNum(priceTarget?.target_median, null)
+      ].some((v) => v !== null)
+    );
+
+  if (hasRecommendation && hasCalendar && hasAnnualEstimates && hasPriceTarget) {
+    return "full";
+  }
+  if (hasRecommendation || hasCalendar || hasAnnualEstimates || hasPriceTarget) {
+    return "partial";
+  }
+  return "unavailable";
+}
+
+async function buildEstimatesTargetsPack(symbol) {
+  const sourceStatus = [];
+  const warnings = [];
+  const currentFY = inferCurrentFiscalYear(symbol);
+
+  const recommendationPayload = await tryFinnhub(
+    "/stock/recommendation",
+    { symbol },
+    "finnhub_recommendation_trends",
+    sourceStatus,
+    warnings
+  );
+  const earningsCalendarPayload = await tryFinnhub(
+    "/calendar/earnings",
+    {
+      symbol,
+      from: formatDateYYYYMMDD(new Date()),
+      to: formatDateYYYYMMDD(new Date(Date.now() + 120 * 86400000))
+    },
+    "finnhub_earnings_calendar",
+    sourceStatus,
+    warnings
+  );
+  const epsEstimatePayload = await tryFinnhub(
+    "/stock/eps-estimate",
+    { symbol, freq: "annual" },
+    "finnhub_eps_estimate",
+    sourceStatus,
+    warnings
+  );
+  const revenueEstimatePayload = await tryFinnhub(
+    "/stock/revenue-estimate",
+    { symbol, freq: "annual" },
+    "finnhub_revenue_estimate",
+    sourceStatus,
+    warnings
+  );
+  const priceTargetPayload = await tryFinnhub(
+    "/stock/price-target",
+    { symbol },
+    "finnhub_price_target",
+    sourceStatus,
+    warnings
+  );
+
+  const recommendationRows = normalizeRecommendationTrendRows(recommendationPayload);
+  const latestRecommendation = recommendationRows.sort(
+    (a, b) => secParseDateMs(b.period) - secParseDateMs(a.period)
+  )[0] || null;
+
+  const earningsCalendar = normalizeFinnhubEarningsCalendar(earningsCalendarPayload, symbol);
+
+  const epsRows = normalizeEstimateRows(epsEstimatePayload, [
+    "avg",
+    "estimate",
+    "epsAvg",
+    "epsMean",
+    "value"
+  ]);
+  const revenueRows = normalizeEstimateRows(revenueEstimatePayload, [
+    "avg",
+    "estimate",
+    "revenueAvg",
+    "revenueMean",
+    "value"
+  ]);
+  const epsMap = mapAnnualEstimateRowsToFY(epsRows, currentFY);
+  const revenueMap = mapAnnualEstimateRowsToFY(revenueRows, currentFY);
+
+  const canonicalPriceTarget =
+    priceTargetPayload && typeof priceTargetPayload === "object"
+      ? {
+          target_mean: toNum(priceTargetPayload?.targetMean, null),
+          target_high: toNum(priceTargetPayload?.targetHigh, null),
+          target_low: toNum(priceTargetPayload?.targetLow, null),
+          target_median: toNum(priceTargetPayload?.targetMedian, null),
+          last_updated: priceTargetPayload?.lastUpdated || null,
+          provider: "finnhub_price_target"
+        }
+      : null;
+
+  const coverageAssessment = buildEstimateCoverage({
+    recommendation: latestRecommendation,
+    earningsCalendar,
+    epsMap,
+    revenueMap,
+    priceTarget: canonicalPriceTarget
+  });
+
+  if (coverageAssessment === "unavailable") {
+    warnings.push("No usable structured estimates data was returned; all estimate fields remain null.");
+  }
+
+  const analystCount =
+    epsMap?.fy1?.analysts ??
+    epsMap?.fy0?.analysts ??
+    revenueMap?.fy1?.analysts ??
+    revenueMap?.fy0?.analysts ??
+    null;
+
+  const out = {
+    coverage_assessment: coverageAssessment,
+    current_fiscal_year: currentFY,
+    canonical_estimates: {
+      recommendation_trends: latestRecommendation
+        ? {
+            period: latestRecommendation.period,
+            strong_buy: latestRecommendation.strongBuy,
+            buy: latestRecommendation.buy,
+            hold: latestRecommendation.hold,
+            sell: latestRecommendation.sell,
+            strong_sell: latestRecommendation.strongSell,
+            provider: "finnhub_recommendation_trends"
+          }
+        : null,
+      earnings_calendar: earningsCalendar
+        ? {
+            date: earningsCalendar?.date || null,
+            hour: earningsCalendar?.hour || null,
+            eps_estimate: toNum(
+              earningsCalendar?.epsEstimate ?? earningsCalendar?.epsActualEstimate,
+              null
+            ),
+            revenue_estimate: toNum(
+              earningsCalendar?.revenueEstimate ?? earningsCalendar?.revenueActualEstimate,
+              null
+            ),
+            provider: "finnhub_earnings_calendar",
+            estimate_basis: "non_gaap_or_unknown"
+          }
+        : null,
+      eps_revenue_estimates: {
+        eps_fy0_est: epsMap?.fy0?.avg ?? null,
+        eps_fy1_est: epsMap?.fy1?.avg ?? null,
+        eps_fy2_est: epsMap?.fy2?.avg ?? null,
+        revenue_fy0_est: revenueMap?.fy0?.avg ?? null,
+        revenue_fy1_est: revenueMap?.fy1?.avg ?? null,
+        revenue_fy2_est: revenueMap?.fy2?.avg ?? null,
+        eps_basis: epsRows.length > 0 ? "non_gaap_or_unknown" : "unknown",
+        revenue_basis: revenueRows.length > 0 ? "reported_currency_or_unknown" : "unknown",
+        provider:
+          epsRows.length > 0 || revenueRows.length > 0
+            ? "finnhub_eps_revenue_estimates"
+            : null
+      },
+      analyst_price_targets:
+        canonicalPriceTarget &&
+        [
+          canonicalPriceTarget.target_mean,
+          canonicalPriceTarget.target_high,
+          canonicalPriceTarget.target_low,
+          canonicalPriceTarget.target_median
+        ].some((v) => v !== null)
+          ? canonicalPriceTarget
+          : null
+    },
+    reference_estimates: {
+      provider: null,
+      usage: "reference_only_not_canonical",
+      notes: []
+    },
+    event_context: {
+      next_earnings_date: earningsCalendar?.date || null,
+      next_earnings_hour: earningsCalendar?.hour || null,
+      provider: earningsCalendar ? "finnhub_earnings_calendar" : null
+    },
+
+    eps_fy0_est: epsMap?.fy0?.avg ?? null,
+    eps_fy1_est: epsMap?.fy1?.avg ?? null,
+    eps_fy2_est: epsMap?.fy2?.avg ?? null,
+    revenue_fy0_est: revenueMap?.fy0?.avg ?? null,
+    revenue_fy1_est: revenueMap?.fy1?.avg ?? null,
+    revenue_fy2_est: revenueMap?.fy2?.avg ?? null,
+    target_price_consensus: canonicalPriceTarget?.target_mean ?? null,
+    target_price_low: canonicalPriceTarget?.target_low ?? null,
+    target_price_high: canonicalPriceTarget?.target_high ?? null,
+    analyst_count: analystCount,
+    estimate_revision_direction: null,
+    next_earnings_date: earningsCalendar?.date || null
+  };
+
+  return { data: out, sourceStatus, warnings };
+}
+
+async function getQuoteWithFallback(symbol) {
+  const sourceStatus = [];
+  let data = null;
+
+  try {
+    const q = await finnhubGet("/quote", { symbol });
+    if (q && toNum(q.c, null) !== null) {
+      data = {
+        provider: "finnhub_quote",
+        symbol,
+        price: toNum(q.c, null),
+        change: toNum(q.d, null),
+        change_pct: toNum(q.dp, null),
+        ts: q.t ? new Date(q.t * 1000).toISOString() : null
+      };
+      sourceStatus.push({ provider: "finnhub_quote", status: "ok", note: "quote loaded" });
+      return { data, sourceStatus };
+    }
+    sourceStatus.push({ provider: "finnhub_quote", status: "partial", note: "empty quote response" });
+  } catch (e) {
+    sourceStatus.push({ provider: "finnhub_quote", status: "partial", note: `quote unavailable: ${e.message}` });
+  }
+
+  try {
+    const alpha = await alphaGet({ function: "GLOBAL_QUOTE", symbol });
+    const q = alpha?.["Global Quote"] || {};
+    const price = toNum(q["05. price"], null);
+    if (price !== null) {
+      data = {
+        provider: "alpha_global_quote",
+        symbol,
+        price,
+        change: toNum(q["09. change"], null),
+        change_pct: toNum(String(q["10. change percent"] || "").replace("%", ""), null),
+        ts: null
+      };
+      sourceStatus.push({ provider: "alpha_global_quote", status: "ok", note: "global quote loaded" });
+      return { data, sourceStatus };
+    }
+    sourceStatus.push({ provider: "alpha_global_quote", status: "partial", note: "alpha global quote empty" });
+  } catch (e) {
+    sourceStatus.push({ provider: "alpha_global_quote", status: "partial", note: `alpha global quote unavailable: ${e.message}` });
+  }
+
+  return { data: null, sourceStatus };
+}
+
+async function getProxyQuoteMap(symbols = []) {
+  const results = await Promise.all(symbols.map((s) => getQuoteWithFallback(s)));
+  const map = {};
+  const sourceStatus = [];
+  for (let i = 0; i < symbols.length; i++) {
+    map[symbols[i]] = results[i].data;
+    sourceStatus.push(...results[i].sourceStatus);
+  }
+  return { map, sourceStatus };
+}
+
+function selectTopBottomByChange(quotes = {}) {
+  const rows = Object.entries(quotes)
+    .map(([symbol, q]) => ({
+      symbol,
+      change_pct: toNum(q?.change_pct, null)
+    }))
+    .filter((r) => r.change_pct !== null)
+    .sort((a, b) => b.change_pct - a.change_pct);
+
+  return {
+    leaders: rows.slice(0, 2),
+    laggards: rows.slice(-2).reverse()
+  };
+}
+
+function classifyMarketState({ spy, qqq, iwm, vix }) {
+  const pos = [spy, qqq, iwm].filter((x) => x !== null && x > 0).length;
+  if (vix !== null && vix >= 25 && pos <= 1) return "risk_off_high_vol";
+  if (pos === 3 && (vix === null || vix < 20)) return "trend_up_broadening";
+  if (pos >= 2) return "trend_up_but_selective";
+  if (pos === 1) return "mixed";
+  return "risk_off";
+}
+
+function classifyBreadthHealth({ leaders, laggards, spy, iwm, qqq }) {
+  const leaderPos = leaders.filter((x) => x.change_pct !== null && x.change_pct > 0).length;
+  const laggardNeg = laggards.filter((x) => x.change_pct !== null && x.change_pct < 0).length;
+  if (spy !== null && qqq !== null && iwm !== null && spy > 0 && qqq > 0 && iwm > 0 && leaderPos >= 2) {
+    return "healthy";
+  }
+  if (spy !== null && qqq !== null && iwm !== null && qqq > 0 && iwm < 0) {
+    return "narrow";
+  }
+  if (laggardNeg >= 2) return "weak";
+  return "neutral";
+}
+
+function classifyLiquidityState({ us10y, real10y, vix, breadthHealth }) {
+  if ((us10y !== null && us10y >= 4.5) || (real10y !== null && real10y >= 2.0) || (vix !== null && vix >= 25)) {
+    return "tight";
+  }
+  if (breadthHealth === "healthy" && (vix === null || vix < 20)) return "supportive";
+  return "neutral";
+}
+
+function classifyMacroRegime({ cpiYoy, unemployment, payrolls }) {
+  if (cpiYoy !== null && cpiYoy > 0.035 && unemployment !== null && unemployment < 0.045) {
+    return "inflationary_with_resilient_growth";
+  }
+  if (cpiYoy !== null && cpiYoy < 0.03 && payrolls !== null && payrolls > 0) {
+    return "disinflation_with_stable_growth";
+  }
+  return "mixed";
+}
+
+function shouldEnterValuation({ instrumentType = "us_equity", liquidityState, macroRiskLevel }) {
+  if (!["us_equity", "adr_equity"].includes(instrumentType)) return "background_only";
+  if (macroRiskLevel === "high") return "scenario_only";
+  if (liquidityState === "tight") return "scenario_only";
+  return "direct";
+}
+
+async function buildMacroBreadthLiquidityPack(symbol) {
+  const sourceStatus = [];
+  const warnings = [];
+  const { instrument_type } = classifyLocal(symbol);
+
+  const fredSeries = {
+    cpi_yoy: null,
+    core_cpi_yoy: null,
+    pce_yoy: null,
+    core_pce_yoy: null,
+    unemployment_rate: null,
+    payrolls_last_change: null,
+    retail_sales_yoy: null,
+    ism_manufacturing: null,
+    dxy_broad: null,
+    wti: null,
+    brent: null,
+    gold: null,
+    silver: null,
+    copper: null,
+    natgas: null,
+    vix: null,
+    sp500: null,
+    nasdaq: null
+  };
+
+  if (FRED_API_KEY) {
+    try {
+      const [
+        cpiYoy,
+        coreCpiYoy,
+        pceYoy,
+        corePceYoy,
+        unrate,
+        payrollDiff,
+        retailYoy,
+        ismMfg,
+        dxyBroad,
+        wti,
+        brent,
+        gold,
+        silver,
+        copper,
+        natgas,
+        vix,
+        sp500,
+        nasdaq
+      ] = await Promise.all([
+        fredYoy("CPIAUCSL"),
+        fredYoy("CPILFESL"),
+        fredYoy("PCEPI"),
+        fredYoy("PCEPILFE"),
+        fredLatestObservation("UNRATE"),
+        fredDiffLatest("PAYEMS"),
+        fredYoy("RSAFS"),
+        fredLatestObservation("NAPM"),
+        fredLatestObservation("DTWEXBGS"),
+        fredLatestObservation("DCOILWTICO"),
+        fredLatestObservation("DCOILBRENTEU"),
+        fredLatestObservation("GOLDAMGBD228NLBM"),
+        fredLatestObservation("SLVPRUSD"),
+        fredLatestObservation("PCOPPUSDM"),
+        fredLatestObservation("DHHNGSP"),
+        fredLatestObservation("VIXCLS"),
+        fredLatestObservation("SP500"),
+        fredLatestObservation("NASDAQCOM")
+      ]);
+
+      fredSeries.cpi_yoy = cpiYoy.value;
+      fredSeries.core_cpi_yoy = coreCpiYoy.value;
+      fredSeries.pce_yoy = pceYoy.value;
+      fredSeries.core_pce_yoy = corePceYoy.value;
+      fredSeries.unemployment_rate = unrate.value;
+      fredSeries.payrolls_last_change = payrollDiff.value;
+      fredSeries.retail_sales_yoy = retailYoy.value;
+      fredSeries.ism_manufacturing = ismMfg.value;
+      fredSeries.dxy_broad = dxyBroad.value;
+      fredSeries.wti = wti.value;
+      fredSeries.brent = brent.value;
+      fredSeries.gold = gold.value;
+      fredSeries.silver = silver.value;
+      fredSeries.copper = copper.value;
+      fredSeries.natgas = natgas.value;
+      fredSeries.vix = vix.value;
+      fredSeries.sp500 = sp500.value;
+      fredSeries.nasdaq = nasdaq.value;
+
+      sourceStatus.push({ provider: "fred", status: "ok", note: "macro series loaded" });
+    } catch (e) {
+      sourceStatus.push({ provider: "fred", status: "partial", note: `fred macro series unavailable: ${e.message}` });
+      warnings.push(`fred macro series unavailable: ${e.message}`);
+    }
+  } else {
+    sourceStatus.push({ provider: "fred", status: "partial", note: "FRED_API_KEY missing" });
+    warnings.push("FRED_API_KEY missing; macro series coverage reduced.");
+  }
+
+  let treasuryRates = { us2y: null, us10y: null, us30y: null, real10y: null };
+  try {
+    const nominalXml = await treasuryXmlGet(
+      "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml?data=daily_treasury_yield_curve"
+    );
+    const realXml = await treasuryXmlGet(
+      "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml?data=daily_treasury_real_yield_curve"
+    );
+    treasuryRates.us2y = extractLatestXmlTagValue(nominalXml, "BC_2YEAR");
+    treasuryRates.us10y = extractLatestXmlTagValue(nominalXml, "BC_10YEAR");
+    treasuryRates.us30y = extractLatestXmlTagValue(nominalXml, "BC_30YEAR");
+    treasuryRates.real10y = extractLatestXmlTagValue(realXml, "TC_10YEAR");
+    if (treasuryRates.us2y !== null || treasuryRates.us10y !== null || treasuryRates.real10y !== null) {
+      sourceStatus.push({ provider: "treasury", status: "ok", note: "treasury yield curves loaded" });
+    } else {
+      sourceStatus.push({ provider: "treasury", status: "partial", note: "treasury xml parsed but values empty" });
+    }
+  } catch (e) {
+    sourceStatus.push({ provider: "treasury", status: "partial", note: `treasury rates unavailable: ${e.message}` });
+    warnings.push(`treasury rates unavailable: ${e.message}`);
+  }
+
+  const proxies = [
+    "SPY", "QQQ", "DIA", "IWM",
+    "XLK", "XLF", "XLE", "XLV", "XLI", "XLP", "XLY", "XLB", "XLU", "XLRE", "XLC",
+    "VUG", "VTV"
+  ];
+  const { map: proxyQuotes, sourceStatus: proxySourceStatus } = await getProxyQuoteMap(proxies);
+  sourceStatus.push(...proxySourceStatus);
+
+  const sectors = {
+    Technology: proxyQuotes.XLK,
+    Financials: proxyQuotes.XLF,
+    Energy: proxyQuotes.XLE,
+    Healthcare: proxyQuotes.XLV,
+    Industrials: proxyQuotes.XLI,
+    Staples: proxyQuotes.XLP,
+    Discretionary: proxyQuotes.XLY,
+    Materials: proxyQuotes.XLB,
+    Utilities: proxyQuotes.XLU,
+    RealEstate: proxyQuotes.XLRE,
+    Communication: proxyQuotes.XLC
+  };
+
+  const sectorRank = selectTopBottomByChange(
+    Object.fromEntries(
+      Object.entries(sectors).map(([k, v]) => [k, { change_pct: toNum(v?.change_pct, null) }])
+    )
+  );
+
+  let calendarEvents = [];
+  try {
+    const rawCalendar = await tradingEconomicsGet("/calendar");
+    calendarEvents = normalizeArrayPayload(rawCalendar)
+      .slice(0, 300)
+      .map((r) => ({
+        date: r?.Date || r?.date || null,
+        country: r?.Country || r?.country || null,
+        event: r?.Event || r?.event || null,
+        importance: r?.Importance || r?.importance || r?.Category || null,
+        actual: r?.Actual ?? null,
+        forecast: r?.Forecast ?? null,
+        previous: r?.Previous ?? null
+      }))
+      .filter((r) => r.date && r.event);
+    sourceStatus.push({ provider: "tradingeconomics_calendar", status: "ok", note: "calendar snapshot loaded" });
+  } catch (e) {
+    sourceStatus.push({ provider: "tradingeconomics_calendar", status: "partial", note: `calendar unavailable: ${e.message}` });
+    warnings.push(`calendar unavailable: ${e.message}`);
+  }
+
+  const nextByRegex = (regex) =>
+    calendarEvents
+      .filter((r) => regex.test(String(r.event || "")) && secParseDateMs(r.date) >= Date.now())
+      .sort((a, b) => secParseDateMs(a.date) - secParseDateMs(b.date))[0] || null;
+
+  const nextCpi = nextByRegex(/\bCPI\b|Consumer Price/i);
+  const nextNfp = nextByRegex(/Non Farm Payroll|Nonfarm Payroll|Payroll/i);
+  const nextFomc = nextByRegex(/FOMC|Federal Reserve|Interest Rate Decision/i);
+  const nextPce = nextByRegex(/\bPCE\b|Personal Consumption Expenditure/i);
+  const nextRetail = nextByRegex(/Retail Sales/i);
+
+  const spyChg = toNum(proxyQuotes.SPY?.change_pct, null);
+  const qqqChg = toNum(proxyQuotes.QQQ?.change_pct, null);
+  const iwmChg = toNum(proxyQuotes.IWM?.change_pct, null);
+
+  const marketState = classifyMarketState({
+    spy: spyChg,
+    qqq: qqqChg,
+    iwm: iwmChg,
+    vix: fredSeries.vix
+  });
+  const breadthHealth = classifyBreadthHealth({
+    leaders: sectorRank.leaders,
+    laggards: sectorRank.laggards,
+    spy: spyChg,
+    iwm: iwmChg,
+    qqq: qqqChg
+  });
+  const liquidityState = classifyLiquidityState({
+    us10y: treasuryRates.us10y,
+    real10y: treasuryRates.real10y,
+    vix: fredSeries.vix,
+    breadthHealth
+  });
+  const macroRegime = classifyMacroRegime({
+    cpiYoy: fredSeries.cpi_yoy,
+    unemployment: fredSeries.unemployment_rate,
+    payrolls: fredSeries.payrolls_last_change
+  });
+
+  const calendarRiskLevel =
+    [nextCpi, nextNfp, nextFomc].filter(Boolean).length >= 2
+      ? "high"
+      : [nextCpi, nextNfp, nextFomc].filter(Boolean).length === 1
+      ? "medium"
+      : "low";
+
+  const shouldValuation = shouldEnterValuation({
+    instrumentType: instrument_type,
+    liquidityState,
+    macroRiskLevel: calendarRiskLevel
+  });
+
+  const out = {
+    as_of_time: new Date().toISOString(),
+    rates: {
+      us2y: treasuryRates.us2y,
+      us10y: treasuryRates.us10y,
+      us30y: treasuryRates.us30y,
+      real10y: treasuryRates.real10y,
+      curve_2s10s:
+        treasuryRates.us10y !== null && treasuryRates.us2y !== null
+          ? treasuryRates.us10y - treasuryRates.us2y
+          : null,
+      rate_regime:
+        treasuryRates.us10y !== null
+          ? treasuryRates.us10y >= 4.5
+            ? "high_rate"
+            : treasuryRates.us10y >= 3.5
+            ? "restrictive_but_normalized"
+            : "accommodative"
+          : null,
+      valuation_pressure:
+        treasuryRates.us10y !== null || treasuryRates.real10y !== null
+          ? liquidityState === "tight"
+            ? "high"
+            : liquidityState === "supportive"
+            ? "low"
+            : "medium"
+          : null
+    },
+    macro_calendar: {
+      next_cpi: nextCpi,
+      next_nfp: nextNfp,
+      next_fomc: nextFomc,
+      next_pce: nextPce,
+      next_retail_sales: nextRetail,
+      calendar_risk_level: calendarRiskLevel
+    },
+    macro_series: {
+      cpi_yoy: fredSeries.cpi_yoy,
+      core_cpi_yoy: fredSeries.core_cpi_yoy,
+      pce_yoy: fredSeries.pce_yoy,
+      core_pce_yoy: fredSeries.core_pce_yoy,
+      unemployment_rate: fredSeries.unemployment_rate,
+      payrolls_last_change: fredSeries.payrolls_last_change,
+      retail_sales_yoy: fredSeries.retail_sales_yoy,
+      ism_manufacturing: fredSeries.ism_manufacturing,
+      macro_growth_inflation_mix:
+        fredSeries.cpi_yoy !== null && fredSeries.unemployment_rate !== null
+          ? fredSeries.cpi_yoy > 0.03 && fredSeries.unemployment_rate < 0.045
+            ? "hot_growth_hot_inflation"
+            : fredSeries.cpi_yoy < 0.03 && fredSeries.unemployment_rate < 0.05
+            ? "soft_landing"
+            : "mixed"
+          : null
+    },
+    market_environment: {
+      spx_proxy: proxyQuotes.SPY,
+      ndx_proxy: proxyQuotes.QQQ,
+      dji_proxy: proxyQuotes.DIA,
+      rut_proxy: proxyQuotes.IWM,
+      vix: fredSeries.vix,
+      top_sector_1: sectorRank.leaders[0] || null,
+      top_sector_2: sectorRank.leaders[1] || null,
+      weakest_sector_1: sectorRank.laggards[0] || null,
+      weakest_sector_2: sectorRank.laggards[1] || null,
+      growth_vs_value:
+        toNum(proxyQuotes.VUG?.change_pct, null) !== null &&
+        toNum(proxyQuotes.VTV?.change_pct, null) !== null
+          ? proxyQuotes.VUG.change_pct > proxyQuotes.VTV.change_pct
+            ? "growth_outperforming"
+            : "value_outperforming"
+          : null,
+      large_vs_small:
+        spyChg !== null && iwmChg !== null
+          ? spyChg > iwmChg
+            ? "large_outperforming"
+            : "small_outperforming"
+          : null,
+      market_state: marketState
+    },
+    breadth: {
+      breadth_health: breadthHealth,
+      sector_leadership: {
+        leaders: sectorRank.leaders,
+        laggards: sectorRank.laggards
+      },
+      leadership_concentration:
+        qqqChg !== null && iwmChg !== null
+          ? qqqChg > iwmChg
+            ? "mega_cap_concentrated"
+            : "broadening"
+          : null,
+      risk_appetite:
+        marketState === "trend_up_broadening"
+          ? "risk_on"
+          : marketState === "risk_off_high_vol" || marketState === "risk_off"
+          ? "risk_off"
+          : "mixed"
+    },
+    liquidity: {
+      liquidity_state: liquidityState,
+      credit_conditions_note:
+        treasuryRates.us10y !== null && treasuryRates.us10y >= 4.5
+          ? "long-end yields remain restrictive"
+          : "no acute rate stress signal",
+      funding_stress_note:
+        fredSeries.vix !== null && fredSeries.vix >= 25
+          ? "volatility elevated; monitor funding and positioning"
+          : "no acute volatility stress signal"
+    },
+    commodities_fx: {
+      dxy_broad: fredSeries.dxy_broad,
+      wti: fredSeries.wti,
+      brent: fredSeries.brent,
+      gold: fredSeries.gold,
+      silver: fredSeries.silver,
+      copper: fredSeries.copper,
+      natgas: fredSeries.natgas,
+      usd_regime:
+        fredSeries.dxy_broad !== null
+          ? fredSeries.dxy_broad >= 125
+            ? "usd_strong"
+            : "usd_neutral"
+          : null,
+      commodity_regime:
+        fredSeries.wti !== null && fredSeries.gold !== null
+          ? fredSeries.wti > 85
+            ? "energy_tight"
+            : fredSeries.gold > 2200
+            ? "defensive_precious_metals_bid"
+            : "mixed"
+          : null
+    },
+    final_labels: {
+      macro_regime: macroRegime,
+      market_state: marketState,
+      liquidity_state: liquidityState,
+      breadth_health: breadthHealth,
+      should_enter_valuation: shouldValuation
+    },
+
+    macro_regime: macroRegime,
+    market_state: marketState,
+    liquidity_state: liquidityState,
+    should_enter_valuation: shouldValuation,
+    risk_free_rate:
+      treasuryRates.us10y !== null ? treasuryRates.us10y / 100 : null,
+    yield_curve_slope:
+      treasuryRates.us10y !== null && treasuryRates.us2y !== null
+        ? (treasuryRates.us10y - treasuryRates.us2y) / 100
+        : null,
+    usd_context:
+      fredSeries.dxy_broad !== null
+        ? fredSeries.dxy_broad >= 125
+          ? "firm"
+          : "neutral"
+        : null,
+    breadth_score:
+      breadthHealth === "healthy" ? 75 :
+      breadthHealth === "narrow" ? 45 :
+      breadthHealth === "weak" ? 35 :
+      breadthHealth === "neutral" ? 55 : null,
+    breadth_health: breadthHealth,
+    breadth_notes: [
+      sectorRank.leaders[0]
+        ? `Leading sector proxy: ${sectorRank.leaders[0].symbol} (${sectorRank.leaders[0].change_pct}%).`
+        : "No sector leadership signal available.",
+      sectorRank.laggards[0]
+        ? `Weakest sector proxy: ${sectorRank.laggards[0].symbol} (${sectorRank.laggards[0].change_pct}%).`
+        : "No sector laggard signal available.",
+      calendarRiskLevel === "high"
+        ? "High macro event density ahead."
+        : "No clustered macro risk window detected."
+    ]
+  };
+
+  return { data: out, sourceStatus, warnings };
+}
+
+app.post("/v1/estimates-targets-pack", async (req, res) => {
   const symbol = (req.body.symbol || "").toUpperCase().trim();
   if (!symbol) {
     return res
@@ -2238,27 +4064,48 @@ app.post("/v1/estimates-targets-pack", (req, res) => {
       .json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
   }
 
-  return res.json(
-    success(
-      {
-        eps_fy0_est: 5.0,
-        eps_fy1_est: 5.5,
-        eps_fy2_est: 6.1,
-        revenue_fy0_est: 10000000000,
-        revenue_fy1_est: 11000000000,
-        revenue_fy2_est: 12100000000,
-        target_price_consensus: 100.0,
-        target_price_low: 80.0,
-        target_price_high: 120.0,
-        analyst_count: 10,
-        estimate_revision_direction: "flat"
-      },
-      [{ provider: "mock", status: "ok", note: "estimates pack still mock in phase 1" }]
-    )
-  );
+  try {
+    const result = await buildEstimatesTargetsPack(symbol);
+
+    if (result.data.coverage_assessment === "unavailable") {
+      return res
+        .status(502)
+        .json(
+          fail(
+            "ALL_PROVIDERS_UNAVAILABLE",
+            "Unable to assemble usable structured estimates/targets data.",
+            502,
+            result.sourceStatus,
+            result.warnings,
+            false
+          )
+        );
+    }
+
+    return res.json(success(result.data, result.sourceStatus, result.warnings));
+  } catch (e) {
+    return res
+      .status(502)
+      .json(
+        fail(
+          "ALL_PROVIDERS_UNAVAILABLE",
+          `Unable to assemble usable structured estimates/targets data: ${e.message}`,
+          502,
+          [
+            {
+              provider: "estimates_dispatcher",
+              status: "partial",
+              note: `unexpected estimates failure: ${e.message}`
+            }
+          ],
+          [],
+          false
+        )
+      );
+  }
 });
 
-app.post("/v1/macro-breadth-liquidity-pack", (req, res) => {
+app.post("/v1/macro-breadth-liquidity-pack", async (req, res) => {
   const symbol = (req.body.symbol || "").toUpperCase().trim();
   if (!symbol) {
     return res
@@ -2266,27 +4113,29 @@ app.post("/v1/macro-breadth-liquidity-pack", (req, res) => {
       .json(fail("MISSING_REQUIRED_FIELD", "symbol is required.", 400));
   }
 
-  return res.json(
-    success(
-      {
-        macro_regime: "disinflation_with_stable_growth",
-        market_state: "trend_up_but_narrowing_breadth",
-        liquidity_state: "neutral_to_tightening",
-        should_enter_valuation: "scenario_only",
-        risk_free_rate: 0.0435,
-        yield_curve_slope: 0.0021,
-        usd_context: "slightly_firm",
-        breadth_score: 58.4,
-        breadth_health: "neutral",
-        breadth_notes: [
-          "Cap-weight index leadership remains concentrated",
-          "Participation above 200DMA is healthy but not expanding",
-          "Liquidity backdrop is not fully risk-on"
-        ]
-      },
-      [{ provider: "mock", status: "ok", note: "macro pack still mock in phase 1" }]
-    )
-  );
+  try {
+    const result = await buildMacroBreadthLiquidityPack(symbol);
+    return res.json(success(result.data, result.sourceStatus, result.warnings));
+  } catch (e) {
+    return res
+      .status(502)
+      .json(
+        fail(
+          "ALL_PROVIDERS_UNAVAILABLE",
+          `Unable to assemble macro/breadth/liquidity pack: ${e.message}`,
+          502,
+          [
+            {
+              provider: "macro_dispatcher",
+              status: "partial",
+              note: `unexpected macro pack failure: ${e.message}`
+            }
+          ],
+          [],
+          false
+        )
+      );
+  }
 });
 
 app.post("/v1/filings-transcripts-pack", (req, res) => {
@@ -2376,8 +4225,8 @@ app.get("/", (req, res) => {
       security_master: true,
       market_price_pack: true,
       fundamental_actuals_pack: true,
-      estimates_targets_pack: false,
-      macro_breadth_liquidity_pack: false,
+      estimates_targets_pack: true,
+      macro_breadth_liquidity_pack: true,
       filings_transcripts_pack: false,
       technical_structure_pack: false
     }
